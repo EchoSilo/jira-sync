@@ -89,6 +89,14 @@ Stories are sized on the Fibonacci scale **1, 2, 3, 5, 8, 13** by comparing them
     - Finished work goes into the sprint whose dates cover when it finished.
     - Work finished before the first sprint goes into "Sprint 0 (before Jira)". That sprint closes itself at the next rollover, because team-managed boards allow only one active sprint.
     - Sprints are calendar months. When the active sprint's end date passes, the next sync closes it, starts the next one (creating it if needed), and carries unfinished work over.
+- **In Review (optional):** set `"statuses": {"review": "In Review"}` in `.jira-sync.json` once the Jira workflow has that status, with transitions into it.
+  - A finished GSD plan's Story goes to **In Review**, not Done. It reaches Done only when its phase is verified: the roadmap ticks it, or the verification report says `passed` and the UAT log says `complete`.
+  - A debug session whose fix awaits your check (`awaiting_human_verify`) puts its Bug In Review.
+  - Sub-tasks still go to Done with their plan.
+  - Moves are by status **name** (`"progress"` defaults to "In Progress"), so a workflow with extra working statuses such as "Planning" is never mis-targeted.
+  - `reconcile --reopen-unverified` is a one-off that sends Done stories of unverified phases back to In Review.
+  - Non-GSD: `/jira-sync review [KEY]` marks work code-complete, awaiting verification.
+- **Side quests found during verification:** bugs, quick tasks and todos created after a phase's verification began, plus gap-closure plans, get a "relates to" link to that phase's planning/review/verification Task.
 - **Epic roll-up** runs after every sync, `start` and `done`, and checks every child of every open epic, including issues created by hand. If any child is In Progress or Done, the epic moves to at least In Progress. When every child is Done, the epic moves to Done. Like all moves, it is forward-only.
 - **`epics`** lists the open epics to file new work under.
 - **Auto-push (`init --auto-push on`):** after every commit the branch is pushed in the background so the GitHub for Jira app sees it. Never forces; skips mid-rebase/merge; a failed push is logged and retried on the next commit.

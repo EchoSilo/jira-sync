@@ -29,8 +29,8 @@ SYNC_LABEL = 'jira-sync'
 HOOK_MARK = 'installed by jira-sync'
 STABLE = Path.home() / '.jira-sync' / 'jira_sync.py'
 SCOPE_RE = re.compile(r'^\w+!?\(([^)]+)\)')
-CATS = ['new', 'indeterminate', 'done']  # Jira status categories, in workflow order
-CAT_NAMES = {'new': 'To Do', 'indeterminate': 'In Progress', 'done': 'Done'}
+CATS = ['new', 'indeterminate', 'review', 'done']  # workflow order; 'review' only when configured
+CAT_NAMES = {'new': 'To Do', 'indeterminate': 'In Progress', 'review': 'In Review', 'done': 'Done'}
 LOCK_STALE_S = 600
 
 
@@ -406,7 +406,7 @@ def gsd_items(root, started_ids=(), add_dates=None, starts=None):
         r'^\s*- \[[ x]\] ([\d.]+-\d+)-PLAN\.md\s+[\u2014-]+\s+(.+)$', roadmap, re.M)}
     rel = lambda p: p.relative_to(root).as_posix()
     started = set(started_ids)
-    items, phases = [], []
+    items, phases, verify_starts = [], [], {}
     for d in sorted((pl / 'phases').iterdir(), key=lambda p: [int(x) if x.isdigit() else 0 for x in re.split(r'[.-]', p.name.split('-')[0])]):
         m = re.match(r'(\d+(?:\.\d+)*)-(.+)', d.name)
         if not d.is_dir() or not m or m.group(1).startswith('999'):
@@ -417,6 +417,15 @@ def gsd_items(root, started_ids=(), add_dates=None, starts=None):
         phase = {'id': num, 'type': 'epic', 'summary': 'Phase %s: %s' % (num, short_title(name, 50)),
                  'parent': None, 'version': version, 'path': rel(d),
                  'sections': epic_sections(roadmap, num), 'created_at': starts.get(num), 'done_at': None}
+        # Verified = the roadmap ticks the phase, or the goal check passed AND the user signed
+        # off UAT. Until then, finished plans are code-complete stories sitting In Review.
+        vfile, ufile = d / ('%s-VERIFICATION.md' % num), d / ('%s-UAT.md' % num)
+        vstat = frontmatter(vfile.read_text(encoding='utf-8')).get('status') if vfile.exists() else None
+        ustat = frontmatter(ufile.read_text(encoding='utf-8')).get('status') if ufile.exists() else None
+        verified = done or (vstat == 'passed' and ustat == 'complete')
+        vstart = min((add_dates[rel(f)] for f in (vfile, ufile) if rel(f) in add_dates), key=parse_ts, default=None)
+        if vstart:
+            verify_starts[num] = vstart
         # A phase-scoped commit is planning (docs(40): create phase plan), not work.
         children, any_started = [], num == current
         for p in sorted(d.glob('%s-*-PLAN.md' % num)):
@@ -427,7 +436,7 @@ def gsd_items(root, started_ids=(), add_dates=None, starts=None):
             pdone = bool(stext) and frontmatter(stext).get('status', 'complete') == 'complete'
             pstart = pdone or pid in started
             any_started = any_started or pstart
-            cat = 'done' if pdone else 'indeterminate' if pstart else 'new'
+            cat = ('done' if verified else 'review') if pdone else 'indeterminate' if pstart else 'new'
             stitle = (re.search(r'^#\s+Phase [\d.]+ Plan \d+:\s*(.+?)(?:\s+Summary)?\s*$', stext, re.M) or [None, ''])[1]
             title = stitle or plan_lines.get(pid) or tag(text, 'objective') or 'Plan %s' % pid
             sig = plan_signals(text)
@@ -435,14 +444,16 @@ def gsd_items(root, started_ids=(), add_dates=None, starts=None):
                              'parent': num, 'cat': cat, 'version': version, 'path': rel(p),
                              'sections': story_sections(text, stext),
                              'created_at': add_dates.get(rel(p)), 'done_at': add_dates.get(rel(summ)) if pdone else None,
-                             'signals': sig, 'score': plan_score(sig)})
+                             'signals': sig, 'score': plan_score(sig),
+                             # a gap-closure plan is verification follow-up work
+                             'relates': num + '-ops' if re.search(r'^gap_closure:\s*true', text, re.M) else None})
             for i, block in enumerate(re.findall(r'<task\b[^>]*>.*?</task>', text, re.S), 1):
                 children.append({'id': '%s-t%d' % (pid, i), 'type': 'subtask',
                                  'summary': short_title(tag(block, 'name')) or 'Task %d' % i,
                                  'parent': pid, 'cat': 'done' if pdone else 'new',
                                  'version': None, 'path': rel(p), 'sections': subtask_sections(block),
                                  'created_at': None, 'done_at': None})
-        phase['cat'] = 'done' if done else 'indeterminate' if any_started else 'new'
+        phase['cat'] = 'done' if verified else 'indeterminate' if any_started or vstart else 'new'
         finished = re.search(r'^- \[x\] \**Phase %s:.*?completed (\d{4}-\d{2}-\d{2})' % re.escape(num), roadmap, re.M)
         ops = {'id': num + '-ops', 'type': 'task', 'summary': 'Phase %s planning, review and verification' % num,
                'parent': num, 'cat': phase['cat'], 'version': version, 'path': rel(d),
@@ -466,14 +477,24 @@ def gsd_items(root, started_ids=(), add_dates=None, starts=None):
         prior = [x for x in began if t and x[0] <= t]
         return max(prior)[1] if prior else (current if current in phases and not t else phases[0])
 
+    def found_in_verification(epic, created_at):
+        """Side quests: work that appeared after its phase's verification began links to the
+        phase's planning/review/verification task."""
+        vs = verify_starts.get(epic)
+        return epic + '-ops' if vs and created_at and parse_ts(created_at) >= parse_ts(vs) else None
+
     # Work items that live outside phases.
     for sub, cat in (('debug', 'indeterminate'), ('debug/resolved', 'done')):
         for f in sorted((pl / sub).glob('*.md')) if (pl / sub).is_dir() else []:
             text = f.read_text(encoding='utf-8')
-            trig = frontmatter(text).get('trigger') or f.stem.replace('-', ' ')
+            fm = frontmatter(text)
+            trig = fm.get('trigger') or f.stem.replace('-', ' ')
             created = add_dates.get('.planning/debug/%s.md' % f.stem) or add_dates.get(rel(f))
+            bcat = 'review' if cat != 'done' and fm.get('status') == 'awaiting_human_verify' else cat
+            epic = epic_for(created, cat != 'done')
             items.append({'id': 'debug-' + f.stem, 'type': 'bug', 'summary': short_title(trig),
-                          'parent': epic_for(created, cat != 'done'), 'cat': cat, 'version': version,
+                          'relates': found_in_verification(epic, created),
+                          'parent': epic, 'cat': bcat, 'version': version,
                           'path': rel(f), 'sections': bug_sections(text), 'created_at': created,
                           'done_at': add_dates.get(rel(f)) if cat == 'done' else None})
     qdir = pl / 'quick'
@@ -491,8 +512,10 @@ def gsd_items(root, started_ids=(), add_dates=None, starts=None):
         title = tag(ptext, 'objective') or heading or slug.replace('-', ' ')
         created = min((add_dates[rel(x)] for x in q.iterdir() if rel(x) in add_dates), default=None)
         secs = story_sections(ptext, stext) if ptext else [s for s in (_sec('Outcome', body_after_frontmatter(stext)[:1500]),) if s]
+        epic = epic_for(created, not summ)
         items.append({'id': 'quick-' + qid, 'type': 'task', 'summary': short_title(first_sentence(title, 400)),
-                      'parent': epic_for(created, not summ), 'cat': 'done' if summ else 'indeterminate',
+                      'relates': found_in_verification(epic, created),
+                      'parent': epic, 'cat': 'done' if summ else 'indeterminate',
                       'version': version, 'path': rel(q), 'sections': secs, 'created_at': created,
                       'done_at': add_dates.get(rel(summ)) if summ else None})
     for sub, cat in (('todos/pending', 'new'), ('todos/completed', 'done')):
@@ -500,8 +523,10 @@ def gsd_items(root, started_ids=(), add_dates=None, starts=None):
             text = f.read_text(encoding='utf-8')
             title = frontmatter(text).get('title') or f.stem.replace('-', ' ')
             created = add_dates.get('.planning/todos/pending/%s.md' % f.stem) or add_dates.get(rel(f))
+            epic = epic_for(created, cat != 'done')
             items.append({'id': 'todo-' + f.stem, 'type': 'task', 'summary': short_title(title),
-                          'parent': epic_for(created, cat != 'done'), 'cat': cat, 'version': version,
+                          'relates': found_in_verification(epic, created),
+                          'parent': epic, 'cat': cat, 'version': version,
                           'path': rel(f), 'sections': [s for s in (_sec('Details', body_after_frontmatter(text).strip()[:3000]),) if s],
                           'created_at': created, 'done_at': add_dates.get(rel(f)) if cat == 'done' else None})
     archived = {f.name.split('-ROADMAP.md')[0] for f in (pl / 'milestones').glob('*-ROADMAP.md')} if (pl / 'milestones').is_dir() else set()
@@ -585,8 +610,15 @@ def site_allowed(host):
     return host in allowed
 
 
+def jira_for(cfg):
+    st = cfg.get('statuses') or {}
+    return Jira(cfg['site'], progress=st.get('progress'), review=st.get('review'))
+
+
 class Jira:
-    def __init__(self, site):
+    def __init__(self, site, progress=None, review=None):
+        self.progress = progress or 'In Progress'
+        self.review = review  # None: the project has no review step (In Review = Done)
         site = re.sub(r'^https?://', '', site).split('/')[0].lower()
         if not site_allowed(site):
             # The site comes from the repo's committed config: never let a cloned repo
@@ -660,32 +692,58 @@ class Jira:
                 return out[:limit] if limit else out
 
     def synced(self, project, points_field=None):
-        """{gsd_id: {key, cat, points}} for every issue jira-sync created in this project."""
+        """{gsd_id: {key, cat, status, points, parent, links}} for every issue jira-sync created."""
         have = {}
-        fields = ['labels', 'status', 'parent'] + ([points_field] if points_field else [])
+        fields = ['labels', 'status', 'parent', 'issuelinks'] + ([points_field] if points_field else [])
         for i in self.search('project = "%s" AND labels = "%s"' % (project, SYNC_LABEL), fields):
             for label in i['fields']['labels']:
                 if label.startswith('gsd-'):
-                    have[label[4:]] = {'key': i['key'], 'cat': i['fields']['status']['statusCategory']['key'],
-                                       'points': i['fields'].get(points_field) if points_field else None,
-                                       'parent': (i['fields'].get('parent') or {}).get('key')}
+                    f = i['fields']
+                    have[label[4:]] = {'key': i['key'], 'cat': self.state_of(f['status']), 'status': f['status']['name'],
+                                       'points': f.get(points_field) if points_field else None,
+                                       'parent': (f.get('parent') or {}).get('key'),
+                                       'links': {(l.get('outwardIssue') or l.get('inwardIssue') or {}).get('key')
+                                                 for l in f.get('issuelinks') or []}}
         return have
 
-    def category(self, key):
-        return self.req('GET', '/rest/api/3/issue/%s?fields=status' % key)['fields']['status']['statusCategory']['key']
+    def state_of(self, status):
+        """Our workflow state for a Jira status: To Do / In Progress / In Review / Done.
+        'In Review' is only told apart from other in-progress statuses by its configured name."""
+        if self.review and status['name'].lower() == self.review.lower():
+            return 'review'
+        return status['statusCategory']['key']
 
-    def move(self, key, target):
-        """Walk the issue forward to `target` category. Never moves backwards."""
-        for _ in range(3):
-            cur = self.category(key)
-            if CATS.index(cur) >= CATS.index(target):
+    def status(self, key):
+        s = self.req('GET', '/rest/api/3/issue/%s?fields=status' % key)['fields']['status']
+        return self.state_of(s), s['name']
+
+    def misplaced(self, state, name):
+        """In an in-progress status other than the configured one (e.g. 'Planning')."""
+        return state == 'indeterminate' and name.lower() != self.progress.lower()
+
+    def move(self, key, target, allow_back=False):
+        """Walk the issue to `target`. Forward only, unless allow_back (used to send an
+        unverified Done story back to In Review); also corrects a wrong in-progress status."""
+        for _ in range(4):
+            cur, name = self.status(key)
+            if cur == target and not self.misplaced(cur, name):
+                return True
+            if CATS.index(cur) > CATS.index(target) and not allow_back:
                 return True
             options = self.req('GET', '/rest/api/3/issue/%s/transitions' % key)['transitions']
-            t = pick_transition(options, target) or pick_transition(options, CATS[CATS.index(cur) + 1])
+            t = self.pick(options, target) or (self.pick(options, 'indeterminate') if target in ('review', 'done') else None)
             if not t:
                 return False
             self.req('POST', '/rest/api/3/issue/%s/transitions' % key, {'transition': {'id': t['id']}})
-        return self.category(key) == target
+        return self.status(key)[0] == target
+
+    def pick(self, options, target):
+        """Transition into `target`: by status name for In Progress / In Review, by category otherwise."""
+        names = {'indeterminate': self.progress, 'review': self.review}
+        if target in names:
+            want = (names[target] or '').lower()
+            return next((t for t in options if t.get('to', {}).get('name', '').lower() == want), None)
+        return pick_transition(options, target)
 
     def versions(self, project_key):
         return {v['name']: v for v in self.req('GET', '/rest/api/3/project/%s/versions' % project_key)}
@@ -874,7 +932,7 @@ def assign_sprints(j, sp, project, meta, have, items, out, dry=False, fresh=()):
     plan, skipped = {}, 0
     for key in loose:
         it = item_by_id.get(by_key.get(key))
-        done_at = parse_ts(it['done_at']) if it and it.get('done_at') else None
+        done_at = parse_ts(it['done_at']) if it and it.get('done_at') and it['cat'] == 'done' else None
         target = active
         if done_at and first_start and done_at < first_start:
             target = 'history'
@@ -913,7 +971,7 @@ def epic_target(child_cats):
     cats = list(child_cats)
     if cats and all(c == 'done' for c in cats):
         return 'done'
-    if any(c in ('indeterminate', 'done') for c in cats):
+    if any(c in ('indeterminate', 'review', 'done') for c in cats):
         return 'indeterminate'
     return None
 
@@ -951,15 +1009,19 @@ def rollup_epics(j, project, meta, known, out, dry=False, warnings=None):
 
 # ---------------------------------------------------------------------- reconcile
 
-def reconcile(root, cfg, dry=False, out=print, refresh_text=False):
+def reconcile(root, cfg, dry=False, out=print, refresh_text=False, reopen=False):
     project = cfg['project']
     items, ms = load_items(root)
     if ms is None:
         out('no .planning/ directory -- nothing to reconcile (use start/done for non-GSD work)')
         return 0
-    j = Jira(cfg['site'])
+    j = jira_for(cfg)
     meta = j.project(project)
     pf = meta['points']
+    if not j.review:  # no review step configured: code-complete counts as Done
+        for it in items:
+            if it['cat'] == 'review':
+                it['cat'] = 'done'
     have = j.synced(project, pf)
     version_id, created, moved, sized, fixed, warnings = None, 0, 0, 0, 0, []
     fresh = []  # keys of stories/tasks/bugs created this run
@@ -1070,10 +1132,12 @@ def reconcile(root, cfg, dry=False, out=print, refresh_text=False):
                 if pts:
                     cur['points'] = pts
                     sized += 1
-        if CATS.index(it['cat']) > CATS.index(cur['cat']):
+        back = reopen and cur['cat'] == 'done' and it['cat'] == 'review'
+        if (CATS.index(it['cat']) > CATS.index(cur['cat']) or back
+                or (it['cat'] == cur['cat'] and j.misplaced(cur['cat'], cur.get('status', '')))):
             if dry:
                 out('would move   %-18s %s -> %s' % (it['id'], cur['key'], CAT_NAMES[it['cat']]))
-            elif j.move(cur['key'], it['cat']):
+            elif j.move(cur['key'], it['cat'], allow_back=back):
                 out('moved %s %s -> %s' % (cur['key'], it['id'], CAT_NAMES[it['cat']]))
             else:
                 warnings.append('%s could not reach %s: no transition in the workflow' % (cur['key'], CAT_NAMES[it['cat']]))
@@ -1084,6 +1148,20 @@ def reconcile(root, cfg, dry=False, out=print, refresh_text=False):
         warnings += assign_sprints(j, Sprints(j, project), project, meta, have, items, out, dry, fresh)
     except JiraError as e:
         warnings.append('sprint assignment failed: %s' % e)
+    linked = 0
+    for it in items:
+        cur, target = have.get(it['id']), have.get(it.get('relates') or '')
+        if not cur or not target or target['key'] in cur.get('links', ()) or cur['key'].startswith('('):
+            continue
+        if dry:
+            out('would link   %-18s %s relates to %s' % (it['id'], cur['key'], target['key']))
+        else:
+            j.req('POST', '/rest/api/3/issueLink', {'type': {'name': 'Relates'},
+                                                     'inwardIssue': {'key': cur['key']}, 'outwardIssue': {'key': target['key']}})
+            cur.setdefault('links', set()).add(target['key'])
+        linked += 1
+    if linked:
+        out('%s %d verification side-quests to their phase task' % ('would link' if dry else 'linked', linked))
     try:
         moved += rollup_epics(j, project, meta, {v['key']: v['cat'] for v in have.values()}, out, dry, warnings)
     except JiraError as e:
@@ -1212,7 +1290,7 @@ def cmd_doctor(a):
     check(STABLE.exists(), 'hook script copy', str(STABLE))
     if cfg and env('JIRA_EMAIL') and env('JIRA_API_TOKEN'):
         try:
-            j = Jira(cfg['site'])
+            j = jira_for(cfg)
             me = j.req('GET', '/rest/api/3/myself')
             check(True, 'auth', me.get('displayName', '?'))
             meta = j.project(cfg['project'])
@@ -1243,7 +1321,7 @@ def cmd_reconcile(a):
     root = repo_root()
     cfg = need_config(root)
     if a.dry_run:
-        return reconcile(root, cfg, dry=True, refresh_text=a.refresh_text)
+        return reconcile(root, cfg, dry=True, refresh_text=a.refresh_text, reopen=a.reopen_unverified)
     # Share the background sync's lock so a commit-triggered run never races this one.
     lock = git_path(root, 'jira-sync.lock')
     for _ in range(LOCK_STALE_S):
@@ -1260,7 +1338,7 @@ def cmd_reconcile(a):
         def out(line):
             print(line, flush=True)
             os.utime(lock)
-        return reconcile(root, cfg, out=out, refresh_text=a.refresh_text)
+        return reconcile(root, cfg, out=out, refresh_text=a.refresh_text, reopen=a.reopen_unverified)
     finally:
         lock.unlink()
 
@@ -1269,7 +1347,7 @@ def cmd_epics(a):
     """Open epics to file new work under."""
     root = repo_root()
     cfg = need_config(root)
-    j = Jira(cfg['site'])
+    j = jira_for(cfg)
     meta = j.project(cfg['project'])
     for i in j.search('project = "%s" AND issuetype = %s AND statusCategory != Done ORDER BY key DESC'
                       % (cfg['project'], meta['epic']), ['summary', 'status'], limit=50):
@@ -1355,7 +1433,7 @@ def jql_text(s):
 def cmd_search(a):
     root = repo_root()
     cfg = need_config(root)
-    j = Jira(cfg['site'])
+    j = jira_for(cfg)
     jql = 'project = "%s" AND statusCategory != Done AND text ~ "%s" ORDER BY updated DESC' % (cfg['project'], jql_text(a.text))
     issues = j.search(jql, ['summary', 'status', 'issuetype'], limit=10)
     for i in issues:
@@ -1385,7 +1463,7 @@ def start_issue(root, cfg, j, key, branch, summary=None):
 def cmd_create(a):
     root = repo_root()
     cfg = need_config(root)
-    j = Jira(cfg['site'])
+    j = jira_for(cfg)
     meta = j.project(cfg['project'])
     type_id = meta.get(a.type)
     if not type_id:
@@ -1428,7 +1506,7 @@ def cmd_create(a):
 def cmd_use(a):
     root = repo_root()
     cfg = need_config(root)
-    j = Jira(cfg['site'])
+    j = jira_for(cfg)
     summary = j.req('GET', '/rest/api/3/issue/%s?fields=summary' % a.key)['fields']['summary']
     start_issue(root, cfg, j, a.key, a.branch, summary)
     return 0
@@ -1442,12 +1520,16 @@ def cmd_done(a):
     key = a.key or active
     if not key:
         raise SystemExit('no key given and no current issue')
-    j = Jira(cfg['site'])
-    ok = j.move(key, 'done')
-    if key == active:
+    j = jira_for(cfg)
+    target = getattr(a, 'target', 'done')
+    if target == 'review' and not j.review:
+        raise SystemExit('no review status configured: set "statuses": {"review": "In Review"} in %s' % CONFIG)
+    ok = j.move(key, target)
+    if key == active and target == 'done':
         active_f.unlink()
-    print('%s -> Done' % key if ok else 'WARNING %s could not reach Done: no transition in the workflow' % key)
-    rollup_epics(j, cfg['project'], j.project(cfg['project']), {key: 'done'} if ok else {}, print)
+    print('%s -> %s' % (key, CAT_NAMES[target]) if ok else
+          'WARNING %s could not reach %s: no transition into it in the workflow' % (key, CAT_NAMES[target]))
+    rollup_epics(j, cfg['project'], j.project(cfg['project']), {key: target} if ok else {}, print)
     return 0 if ok else 1
 
 
@@ -1523,7 +1605,7 @@ def cmd_estimate(a):
     """Claude's review pass: list automatic guesses, or set reviewed points with a reason."""
     root = repo_root()
     cfg = need_config(root)
-    j = Jira(cfg['site'])
+    j = jira_for(cfg)
     meta = j.project(cfg['project'])
     pf = meta['points']
     if not pf:
@@ -1596,6 +1678,8 @@ def main(argv=None):
     sub.add_parser('doctor').set_defaults(fn=cmd_doctor)
     s = sub.add_parser('reconcile'); s.add_argument('--dry-run', action='store_true')
     s.add_argument('--refresh-text', action='store_true', help='rewrite summary + description of every synced issue')
+    s.add_argument('--reopen-unverified', action='store_true',
+                   help='one-off: send Done stories whose phase is not verified back to In Review')
     s.set_defaults(fn=cmd_reconcile)
     sub.add_parser('epics').set_defaults(fn=cmd_epics)
     s = sub.add_parser('search'); s.add_argument('text'); s.set_defaults(fn=cmd_search)
@@ -1611,7 +1695,9 @@ def main(argv=None):
     s = sub.add_parser('estimate'); s.add_argument('--set', help='KEY=PTS'); s.add_argument('--reason')
     s.add_argument('--limit', type=int, default=50); s.set_defaults(fn=cmd_estimate)
     s = sub.add_parser('use'); s.add_argument('key'); s.add_argument('--branch', action='store_true'); s.set_defaults(fn=cmd_use)
-    s = sub.add_parser('done'); s.add_argument('key', nargs='?'); s.set_defaults(fn=cmd_done)
+    s = sub.add_parser('done'); s.add_argument('key', nargs='?'); s.set_defaults(fn=cmd_done, target='done')
+    s = sub.add_parser('review', help='code complete, awaiting verification')
+    s.add_argument('key', nargs='?'); s.set_defaults(fn=cmd_done, target='review')
     sub.add_parser('status').set_defaults(fn=cmd_status)
     s = sub.add_parser('commit-msg'); s.add_argument('file'); s.set_defaults(fn=cmd_commit_msg)
     sub.add_parser('post-commit').set_defaults(fn=cmd_post_commit)

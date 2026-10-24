@@ -76,7 +76,9 @@ def test_gsd_items():
         assert '999.1' not in by and '999.1-01' not in by
         assert by['39']['cat'] == 'done' and by['39']['summary'] == 'Phase 39: Start the Clocks'
         assert by['41']['cat'] == 'indeterminate' and by['42']['cat'] == 'new'
-        assert by['41-01']['cat'] == 'done' and by['41-01-t1']['cat'] == 'done'
+        # code-complete but phase 41 not verified -> In Review; its tasks are done
+        assert by['41-01']['cat'] == 'review' and by['41-01-t1']['cat'] == 'done'
+        assert by['39-01']['cat'] == 'done'  # phase 39 ticked in the roadmap = verified
         assert by['41-02']['cat'] == 'indeterminate'  # has a commit, no summary
         assert by['41-03']['cat'] == 'new'
         assert by['41-02']['summary'] == 'Finish the tab. More text'
@@ -203,6 +205,49 @@ def test_adf_doc_shape():
     kinds = [n['type'] for n in doc['content']]
     assert kinds == ['heading', 'paragraph', 'paragraph', 'heading', 'bulletList', 'heading', 'codeBlock', 'paragraph']
     assert doc['content'][4]['content'][0]['content'][0]['content'][0]['marks'] == [{'type': 'code'}]
+
+
+def test_verification_review_and_side_quests():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        fm = lambda *lines: '---\n%s\n---\n' % '\n'.join(lines)
+        write(root, '.planning/STATE.md', fm('milestone: v1', 'current_phase: 2'))
+        write(root, '.planning/ROADMAP.md', '- [ ] **Phase 1: A**\n- [ ] **Phase 2: B**\n')
+        for n in (1, 2):
+            write(root, '.planning/phases/%d-x/%d-01-PLAN.md' % (n, n), '<task><name>t</name></task>')
+            write(root, '.planning/phases/%d-x/%d-01-SUMMARY.md' % (n, n), fm('status: complete'))
+        write(root, '.planning/phases/1-x/1-VERIFICATION.md', fm('status: passed'))
+        write(root, '.planning/phases/1-x/1-UAT.md', fm('status: complete'))
+        write(root, '.planning/phases/2-x/2-VERIFICATION.md', fm('status: gaps_found'))
+        write(root, '.planning/phases/2-x/2-02-PLAN.md', fm('gap_closure: true') + '<task><name>fix</name></task>')
+        write(root, '.planning/debug/found-late.md', fm('status: awaiting_human_verify', 'trigger: t'))
+        write(root, '.planning/debug/found-early.md', fm('status: investigating', 'trigger: t'))
+        dates = {'.planning/phases/2-x/2-VERIFICATION.md': '2026-10-20T00:00:00+00:00',
+                 '.planning/debug/found-late.md': '2026-10-21T00:00:00+00:00',
+                 '.planning/debug/found-early.md': '2026-10-19T00:00:00+00:00'}
+        items, _ = js.gsd_items(root, (), dates, {'1': '2026-10-01T00:00:00+00:00', '2': '2026-10-10T00:00:00+00:00'})
+        by = {it['id']: it for it in items}
+        assert by['1']['cat'] == 'done' and by['1-01']['cat'] == 'done'             # passed + UAT complete
+        assert by['2']['cat'] == 'indeterminate' and by['2-01']['cat'] == 'review'   # gaps_found: not verified
+        assert by['2-02']['relates'] == '2-ops'                                     # gap-closure plan
+        assert by['debug-found-late']['cat'] == 'review'                           # fix awaiting your check
+        assert by['debug-found-late']['relates'] == '2-ops'                        # found during verification
+        assert by['debug-found-early']['relates'] is None                          # found before it
+
+
+def test_status_selection():
+    j = js.Jira.__new__(js.Jira)
+    j.progress, j.review = 'In Progress', 'In Review'
+    st = lambda name, cat: {'name': name, 'statusCategory': {'key': cat}}
+    assert j.state_of(st('In Review', 'indeterminate')) == 'review'
+    assert j.state_of(st('Planning', 'indeterminate')) == 'indeterminate'
+    assert j.misplaced('indeterminate', 'Planning') and not j.misplaced('indeterminate', 'In Progress')
+    opts = [{'id': '2', 'to': st('Planning', 'indeterminate')}, {'id': '3', 'to': st('In Progress', 'indeterminate')},
+            {'id': '4', 'to': st('In Review', 'indeterminate')}, {'id': '5', 'to': st('Done', 'done')}]
+    assert j.pick(opts, 'indeterminate')['id'] == '3'   # never 'Planning'
+    assert j.pick(opts, 'review')['id'] == '4'
+    assert j.pick(opts, 'done')['id'] == '5'
+    assert j.pick(opts[:2], 'review') is None             # no way into In Review
 
 
 def test_unrecognized():

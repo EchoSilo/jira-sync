@@ -138,6 +138,7 @@ flowchart LR
 | **PRs** | After `gh pr create`, the PR title is prefixed with its issue key. |
 | **GSD sync** | On every commit, `.planning/` is reconciled into Jira in the background. |
 | **Sprints** | Every Story, Task and Bug sits in a sprint. Sprints run by calendar month and roll over automatically. |
+| **In Review** | Optional. Code-complete work waits In Review until GSD verification passes and testing is signed off. Bugs wait there for your confirmation. Side quests found during verification are linked to the phase's verification Task. |
 | **Epics** | Every Story, Task and Bug has an Epic. An Epic moves to In Progress as soon as any child starts, and to Done when every child is Done. |
 | **Story points** | Fibonacci (1, 2, 3, 5, 8, 13) by relative estimation against fixed anchor stories, with a Claude review pass. |
 | **Text** | Summaries are short titles (60 characters at most). Descriptions are sectioned and built from the source files. |

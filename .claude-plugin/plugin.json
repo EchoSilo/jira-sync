@@ -1,6 +1,6 @@
 {
   "name": "jira-sync",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Keep Jira in step with git: issue keys on every commit and PR, automatic Epic/Story/Sub-task sync for GSD projects, and Claude-picked Bug/Story/Task/Epic for everything else.",
   "author": {
     "name": "EchoSilo",
