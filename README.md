@@ -91,18 +91,42 @@ sequenceDiagram
 
 ### Where a GSD item ends up
 
+Solid arrows show what each GSD item becomes. Dotted arrows show the parent each issue sits under in Jira. Every Story, Task and Bug also goes into a sprint: the active one, or the one it finished in.
+
 ```mermaid
-flowchart TD
-    M["Milestone v14.0"] --> FV["Fix Version"]
-    P["Phase 41"] --> E["Epic"]
-    P --> OPS["Task: Phase 41 planning,<br/>review and verification"]
-    PL["Plan 41-04"] --> S["Story + story points"]
-    T["Plan task 1..n"] --> ST["Sub-task"]
-    D["Debug session"] --> B["Bug"]
-    Q["Quick task / todo"] --> TK["Task"]
-    E --> OPS & S & B & TK
-    S --> ST
-    S & OPS & B & TK --> SP["Sprint<br/>(active, or the one it finished in)"]
+flowchart LR
+    subgraph G["GSD .planning/"]
+        direction TB
+        M["Milestone v14.0"]
+        P["Phase 41"]
+        PW["Phase-wide work<br/>discuss, plan, review, verify"]
+        PL["Plan 41-04"]
+        T["Plan task 1..n"]
+        D["Debug session"]
+        Q["Quick task / todo"]
+    end
+    subgraph J["Jira"]
+        direction TB
+        FV["Fix Version"]
+        E["Epic"]
+        OPS["Task<br/>Phase 41 planning, review, verification"]
+        S["Story<br/>with story points"]
+        ST["Sub-task"]
+        B["Bug"]
+        TK["Task"]
+    end
+    M --> FV
+    P --> E
+    PW --> OPS
+    PL --> S
+    T --> ST
+    D --> B
+    Q --> TK
+    E -.-> OPS
+    E -.-> S
+    E -.-> B
+    E -.-> TK
+    S -.-> ST
 ```
 
 ## What it does
