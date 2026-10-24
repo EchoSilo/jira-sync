@@ -1,6 +1,6 @@
 # jira-sync
 
-A Claude Code plugin that keeps a Jira project in step with a git repo. Every commit lands on the right issue, sprints and epics stay filled in, and stories get story points. It understands [GSD](https://github.com/) planning files, and it also works in repos that don't use GSD.
+A Claude Code plugin that keeps a Jira project in step with a git repo. Every commit lands on the right issue, sprints and epics stay filled in, and stories get story points. It understands GSD (Get Shit Done) planning files, and it also works in repos that don't use GSD.
 
 It needs only the Python standard library, and nothing about a site, project or path is hardcoded. A repo opts in with one small config file.
 
