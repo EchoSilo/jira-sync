@@ -10,6 +10,7 @@ synced issue carries the label "jira-sync" plus "gsd-<id>", and the local cache 
 import argparse
 import base64
 import json
+import math
 import os
 import re
 import shutil
@@ -143,6 +144,86 @@ def _plan_summary(text, pid):
     return 'Plan %s: %s' % (pid, first_sentence(m.group(1))) if m else 'Plan %s' % pid
 
 
+# ------------------------------------------------------------ story points
+
+FIB = [1, 2, 3, 5, 8, 13]
+ANCHOR_POINTS = [1, 2, 3, 5, 8]
+ANCHOR_QUANTILES = [0.1, 0.3, 0.5, 0.75, 0.95]
+DEFAULT_TOKENS = 60000
+AUTO_LABEL, REVIEWED_LABEL = 'points-auto', 'points-reviewed'
+
+
+def plan_signals(text):
+    """Plan-time sizing inputs from a GSD PLAN.md (never actuals: points are a forecast)."""
+    fm = re.match(r'---\r?\n(.*?)\r?\n---', text, re.S)
+    head = fm.group(1) if fm else ''
+    tok = re.search(r'^estimate:[ \t]*$(?:\n[ \t]+.*)*?\n[ \t]+tokens:[ \t]*(\d+)', head, re.M)
+    block = re.search(r'^files_modified:[ \t]*$((?:\n[ \t]+-.*)*)', head, re.M)
+    inline = re.search(r'^files_modified:[ \t]*\[(.*)\]', head, re.M)
+    files = (len(re.findall(r'\n[ \t]+-', block.group(1))) if block
+             else len([x for x in inline.group(1).split(',') if x.strip()]) if inline else 0)
+    conf = re.search(r'^[ \t]+confidence:[ \t]*(\w+)', head, re.M)
+    return {'tokens': int(tok.group(1)) if tok else None, 'files': files,
+            'tasks': len(re.findall(r'<task\b', text)),
+            'checkpoints': len(re.findall(r'<task\b[^>]*type="checkpoint', text)),
+            'hands_on': bool(re.search(r'^autonomous:[ \t]*false', head, re.M)),
+            'confidence': conf.group(1).lower() if conf else None}
+
+
+def plan_score(s):
+    """CUE score. Effort = estimated tokens, complexity = files + tasks, unknowns/risk =
+    human checkpoints, hands-on plans and stated confidence. Log scale, so doubling the
+    effort adds one fixed step, the way Fibonacci steps grow."""
+    return round(math.log(s['tokens'] or DEFAULT_TOKENS) + 0.5 * math.log1p(s['files'])
+                 + 0.15 * s['tasks'] + 0.3 * s['checkpoints'] + 0.2 * s['hands_on']
+                 + {'low': 0.2, 'medium': 0.1}.get(s['confidence'], 0), 3)
+
+
+def describe_signals(s):
+    parts = ['est. %dk effort' % round((s['tokens'] or DEFAULT_TOKENS) / 1000), '%d files' % s['files'], '%d tasks' % s['tasks']]
+    if s['checkpoints']:
+        parts.append('%d human checkpoint%s' % (s['checkpoints'], 's' if s['checkpoints'] > 1 else ''))
+    if s['hands_on']:
+        parts.append('not autonomous')
+    return ', '.join(parts)
+
+
+def propose_anchors(stories):
+    """Pick finished stories spread across the score range as the 1/2/3/5/8 references."""
+    done = sorted((s for s in stories if s['cat'] == 'done'), key=lambda s: (s['score'], s['id']))
+    picks, last = [], None
+    for q, pts in zip(ANCHOR_QUANTILES, ANCHOR_POINTS):
+        i = int(q * (len(done) - 1) + 0.5)
+        while i < len(done) and last is not None and done[i]['score'] <= last:
+            i += 1  # anchors must be strictly larger than the one below
+        if i >= len(done):
+            return []
+        last = done[i]['score']
+        picks.append({'id': done[i]['id'], 'points': pts, 'score': done[i]['score'], 'summary': done[i]['summary']})
+    return picks
+
+
+def size_against(score, anchors):
+    """(points, reason) by triangulating between the two anchors a story falls between."""
+    a = sorted((x for x in anchors if x.get('score') is not None), key=lambda x: x['score'])
+    if len(a) < 2:
+        return None, 'fewer than two scored anchors'
+    lo = [x for x in a if x['score'] <= score]
+    hi = [x for x in a if x['score'] > score]
+    if not lo:
+        return a[0]['points'], 'no bigger than the smallest anchor %s (%d)' % (a[0]['id'], a[0]['points'])
+    if not hi:
+        top, gap = a[-1], a[-1]['score'] - a[-2]['score']
+        if score >= top['score'] + gap:
+            pts = FIB[min(FIB.index(top['points']) + 1, len(FIB) - 1)] if top['points'] in FIB else top['points']
+            return pts, 'well beyond the largest anchor %s (%d)' % (top['id'], top['points'])
+        return top['points'], 'about the size of the largest anchor %s (%d)' % (top['id'], top['points'])
+    below, above = lo[-1], hi[0]
+    near = below if score - below['score'] <= above['score'] - score else above
+    return near['points'], 'bigger than %s (%d), smaller than %s (%d), closer to %s' % (
+        below['id'], below['points'], above['id'], above['points'], near['id'])
+
+
 def gsd_items(root, started_ids=()):
     """Desired Jira items derived from .planning/, parents before children.
 
@@ -185,9 +266,11 @@ def gsd_items(root, started_ids=()):
             pstart = pdone or pid in started
             any_started = any_started or pstart
             cat = 'done' if pdone else 'indeterminate' if pstart else 'new'
+            sig = plan_signals(text)
             children.append({'id': pid, 'type': 'story', 'summary': _plan_summary(text, pid),
                              'parent': num, 'cat': cat, 'version': version,
-                             'path': p.relative_to(root).as_posix()})
+                             'path': p.relative_to(root).as_posix(),
+                             'signals': sig, 'score': plan_score(sig)})
             for i, tname in enumerate(re.findall(r'<task\b[^>]*>\s*<name>(.*?)</name>', text, re.S), 1):
                 tname = re.sub(r'^Task \d+:\s*', '', ' '.join(tname.split()))
                 children.append({'id': '%s-t%d' % (pid, i), 'type': 'subtask',
@@ -325,7 +408,22 @@ class Jira:
                 'story': by_name.get('story'), 'task': by_name.get('task'), 'bug': by_name.get('bug')}
         meta['story'] = meta['story'] or meta['task']
         meta['bug'] = meta['bug'] or meta['task']
+        meta['points'] = self.points_field(p['key'], meta['story']) if meta['story'] else None
         return meta
+
+    def points_field(self, project_key, type_id):
+        """Field id of 'Story Points' (company-managed) or 'Story point estimate' (team-managed)."""
+        try:
+            r = self.req('GET', '/rest/api/3/issue/createmeta/%s/issuetypes/%s?maxResults=200' % (project_key, type_id))
+        except JiraError:
+            return None
+        for f in r.get('fields') or r.get('values') or []:
+            if f.get('name', '').lower() in ('story point estimate', 'story points'):
+                return f['fieldId']
+        return None
+
+    def comment(self, key, text):
+        self.req('POST', '/rest/api/3/issue/%s/comment' % key, {'body': adf(text)})
 
     def search(self, jql, fields, limit=None):
         out, token = [], None
@@ -339,13 +437,15 @@ class Jira:
             if not token or r.get('isLast') or (limit and len(out) >= limit):
                 return out[:limit] if limit else out
 
-    def synced(self, project):
-        """{gsd_id: {key, cat}} for every issue jira-sync created in this project."""
+    def synced(self, project, points_field=None):
+        """{gsd_id: {key, cat, points}} for every issue jira-sync created in this project."""
         have = {}
-        for i in self.search('project = "%s" AND labels = "%s"' % (project, SYNC_LABEL), ['labels', 'status']):
+        fields = ['labels', 'status'] + ([points_field] if points_field else [])
+        for i in self.search('project = "%s" AND labels = "%s"' % (project, SYNC_LABEL), fields):
             for label in i['fields']['labels']:
                 if label.startswith('gsd-'):
-                    have[label[4:]] = {'key': i['key'], 'cat': i['fields']['status']['statusCategory']['key']}
+                    have[label[4:]] = {'key': i['key'], 'cat': i['fields']['status']['statusCategory']['key'],
+                                       'points': i['fields'].get(points_field) if points_field else None}
         return have
 
     def category(self, key):
@@ -382,8 +482,22 @@ def reconcile(root, cfg, dry=False, out=print):
         return 0
     j = Jira(cfg['site'])
     meta = j.project(project)
-    have = j.synced(project)
-    version_id, created, moved, warnings = None, 0, 0, []
+    pf = meta['points']
+    have = j.synced(project, pf)
+    version_id, created, moved, sized, warnings = None, 0, 0, 0, []
+    anchors = (cfg.get('estimation') or {}).get('anchors') or []
+    if any(it['type'] == 'story' for it in items):
+        if not pf:
+            warnings.append('story points skipped: no Story Points / Story point estimate field on %s stories' % project)
+        elif len(anchors) < 2:
+            warnings.append('story points skipped: no anchors yet -- run `anchors` and accept a set')
+
+    def size(it):
+        if it['type'] != 'story' or not pf or len(anchors) < 2:
+            return None, None
+        pts, why = size_against(it['score'], anchors)
+        return pts, ('Story points %d (automatic first guess): %s. Signals: %s. '
+                     'Review with /jira-sync estimate.' % (pts, why, describe_signals(it['signals']))) if pts else None
 
     try:
         vers = j.versions(project)
@@ -411,10 +525,14 @@ def reconcile(root, cfg, dry=False, out=print):
             if it['parent'] and not parent:
                 warnings.append('%s skipped: parent %s was not created' % (it['id'], it['parent']))
                 continue
+            pts, note = size(it)
             if dry:
                 out('would create %-7s %-18s %s' % (it['type'], it['id'], it['summary'][:80]))
-                have[it['id']] = {'key': '(new %s)' % it['id'], 'cat': 'new'}
+                have[it['id']] = {'key': '(new %s)' % it['id'], 'cat': 'new', 'points': pts}
                 created += 1
+                if pts:
+                    out('would size   %-18s %d pts -- %s' % (it['id'], pts, note.split(': ', 1)[1].split('. Signals')[0]))
+                    sized += 1
                 if it['cat'] != 'new':
                     out('would move   %-18s -> %s' % (it['id'], CAT_NAMES[it['cat']]))
                     moved += 1
@@ -426,6 +544,9 @@ def reconcile(root, cfg, dry=False, out=print):
                 fields['parent'] = {'key': parent['key']}
             if it['version'] and version_id:
                 fields['fixVersions'] = [{'id': version_id}]
+            if pts:
+                fields[pf] = pts
+                fields['labels'].append(AUTO_LABEL)
             try:
                 key = j.req('POST', '/rest/api/3/issue', {'fields': fields})['key']
             except JiraError as e:
@@ -434,9 +555,25 @@ def reconcile(root, cfg, dry=False, out=print):
                 del fields['fixVersions']  # field not on this issue type's screen
                 key = j.req('POST', '/rest/api/3/issue', {'fields': fields})['key']
                 warnings.append('%s created without fix version: %s' % (key, e))
-            cur = have[it['id']] = {'key': key, 'cat': 'new'}
+            cur = have[it['id']] = {'key': key, 'cat': 'new', 'points': pts}
             created += 1
-            out('created %s %s (%s)' % (key, it['id'], it['type']))
+            out('created %s %s (%s)%s' % (key, it['id'], it['type'], ' %d pts' % pts if pts else ''))
+            if pts:
+                j.comment(key, note)
+                sized += 1
+        elif cur.get('points') is None:
+            # Existing story with no points yet: size it. Points a person set are never overwritten.
+            pts, note = size(it)
+            if pts and dry:
+                out('would size   %-18s %s %d pts' % (it['id'], cur['key'], pts))
+                sized += 1
+            elif pts:
+                j.req('PUT', '/rest/api/3/issue/%s' % cur['key'],
+                      {'fields': {pf: pts}, 'update': {'labels': [{'add': AUTO_LABEL}]}})
+                j.comment(cur['key'], note)
+                cur['points'] = pts
+                sized += 1
+                out('sized %s %s -> %d pts' % (cur['key'], it['id'], pts))
         if CATS.index(it['cat']) > CATS.index(cur['cat']):
             if dry:
                 out('would move   %-18s %s -> %s' % (it['id'], cur['key'], CAT_NAMES[it['cat']]))
@@ -451,8 +588,8 @@ def reconcile(root, cfg, dry=False, out=print):
         write_json(git_path(root, 'jira-sync-map.json'), {k: v['key'] for k, v in have.items()})
     for w in warnings:
         out('WARNING ' + w)
-    out(('dry run: %d to create, %d to move' if dry else 'done: %d created, %d moved') % (created, moved)
-        + ', %d warnings' % len(warnings))
+    out(('dry run: %d to create, %d to move, %d to size' if dry else 'done: %d created, %d moved, %d sized')
+        % (created, moved, sized) + ', %d warnings' % len(warnings))
     return 1 if warnings else 0
 
 
@@ -686,8 +823,17 @@ def cmd_create(a):
         fields['description'] = adf(a.description)
     if a.parent:
         fields['parent'] = {'key': a.parent}
+    if a.points is not None:
+        if a.points not in FIB or not meta['points']:
+            raise SystemExit('points must be one of %s and the project needs a story points field' % FIB)
+        if not a.reason:
+            raise SystemExit('--points needs --reason naming the anchors it was compared against')
+        fields[meta['points']] = a.points
+        fields['labels'] = [REVIEWED_LABEL]
     key = j.req('POST', '/rest/api/3/issue', {'fields': fields})['key']
     print('created %s (%s) %s/browse/%s' % (key, a.type, j.base, key))
+    if a.points is not None:
+        j.comment(key, 'Story points %d (sized against anchors): %s' % (a.points, a.reason))
     if a.start:
         start_issue(root, cfg, j, key, a.branch, a.summary)
     return 0
@@ -728,6 +874,97 @@ def cmd_status(a):
     if log.exists():
         print('last log lines:')
         print('\n'.join(log.read_text(encoding='utf-8').splitlines()[-8:]))
+    return 0
+
+
+def _print_anchor(x, by_id):
+    it = by_id.get(x['id'])
+    sig = ' | ' + describe_signals(it['signals']) if it else ''
+    print('  %2d pts  %-9s score %-6s %s%s' % (x['points'], x['id'], x.get('score'), (x.get('summary') or '')[:70], sig))
+
+
+def cmd_anchors(a):
+    """Show, propose, accept or hand-pick the reference stories points are sized against."""
+    root = repo_root()
+    cfg = need_config(root)
+    items, _ = gsd_items(root, started_ids(root))
+    stories = [it for it in items if it['type'] == 'story']
+    by_id = {it['id']: it for it in stories}
+    est = cfg.setdefault('estimation', {})
+    if a.set:
+        anchors = []
+        for pair in a.set.split(','):
+            gid, _, pts = pair.strip().partition('=')
+            if int(pts) not in FIB:
+                raise SystemExit('%s: %s is not on the scale %s' % (gid, pts, FIB))
+            it = by_id.get(gid)
+            anchors.append({'id': gid, 'points': int(pts), 'score': it['score'] if it else None,
+                            'summary': it['summary'] if it else ''})
+        scored = sorted((x for x in anchors if x['score'] is not None), key=lambda x: x['points'])
+        if any(b['score'] <= s['score'] for s, b in zip(scored, scored[1:])):
+            print('WARNING a bigger-point anchor does not score bigger than a smaller one; automatic sizing will be inconsistent')
+        est['anchors'] = anchors
+    elif a.accept:
+        est['anchors'] = propose_anchors(stories)
+        if not est['anchors']:
+            raise SystemExit('need at least %d finished stories to propose anchors' % len(ANCHOR_POINTS))
+    if a.set or a.accept:
+        write_json(root / CONFIG, cfg)
+        print('anchors saved to %s (commit it):' % CONFIG)
+        for x in est['anchors']:
+            _print_anchor(x, by_id)
+        return 0
+    current = est.get('anchors')
+    if current and not a.propose:
+        print('current anchors:')
+        for x in current:
+            _print_anchor(x, by_id)
+        return 0
+    picks = propose_anchors(stories)
+    if not picks:
+        print('not enough finished stories to propose anchors; name them with --set ID=PTS,...')
+        return 1
+    print('proposed anchors (finished stories spread small -> large):')
+    for x in picks:
+        _print_anchor(x, by_id)
+    print('accept with `anchors --accept`, or swap any with `anchors --set 41-01=1,...`')
+    return 0
+
+
+def cmd_estimate(a):
+    """Claude's review pass: list automatic guesses, or set reviewed points with a reason."""
+    root = repo_root()
+    cfg = need_config(root)
+    j = Jira(cfg['site'])
+    meta = j.project(cfg['project'])
+    pf = meta['points']
+    if not pf:
+        raise SystemExit('project %s has no story points field on stories' % cfg['project'])
+    if a.set:
+        key, _, pts = a.set.partition('=')
+        if not pts.isdigit() or int(pts) not in FIB:
+            raise SystemExit('points must be one of %s' % FIB)
+        if not a.reason:
+            raise SystemExit('--reason is required: name the anchors it was compared against')
+        j.req('PUT', '/rest/api/3/issue/%s' % key, {'fields': {pf: int(pts)}, 'update': {
+            'labels': [{'remove': AUTO_LABEL}, {'add': REVIEWED_LABEL}]}})
+        j.comment(key, 'Story points %s (reviewed against anchors): %s' % (pts, a.reason))
+        print('%s -> %s pts (reviewed)' % (key, pts))
+        return 0
+    items, _ = gsd_items(root, started_ids(root))
+    by_id = {it['id']: it for it in items if it['type'] == 'story'}
+    anchors = (cfg.get('estimation') or {}).get('anchors') or []
+    print('anchors:')
+    for x in anchors:
+        _print_anchor(x, by_id)
+    jql = 'project = "%s" AND labels = "%s" AND statusCategory != Done ORDER BY key' % (cfg['project'], AUTO_LABEL)
+    issues = j.search(jql, ['summary', 'labels', pf], limit=a.limit)
+    print('%d automatic guesses awaiting review (not yet Done):' % len(issues))
+    for i in issues:
+        gid = next((l[4:] for l in i['fields']['labels'] if l.startswith('gsd-')), None)
+        it = by_id.get(gid)
+        print('  %s %s pts  %-9s %s%s' % (i['key'], i['fields'].get(pf), gid or '-', i['fields']['summary'][:70],
+                                         '\n      plan: %s | %s' % (it['path'], describe_signals(it['signals'])) if it else ''))
     return 0
 
 
@@ -773,7 +1010,13 @@ def main(argv=None):
     s.add_argument('--type', required=True, choices=['epic', 'story', 'task', 'bug', 'subtask'])
     s.add_argument('--summary', required=True); s.add_argument('--description'); s.add_argument('--parent')
     s.add_argument('--start', action='store_true'); s.add_argument('--branch', action='store_true')
+    s.add_argument('--points', type=int); s.add_argument('--reason')
     s.set_defaults(fn=cmd_create)
+    s = sub.add_parser('anchors'); s.add_argument('--propose', action='store_true')
+    s.add_argument('--accept', action='store_true'); s.add_argument('--set', help='ID=PTS,ID=PTS,...')
+    s.set_defaults(fn=cmd_anchors)
+    s = sub.add_parser('estimate'); s.add_argument('--set', help='KEY=PTS'); s.add_argument('--reason')
+    s.add_argument('--limit', type=int, default=50); s.set_defaults(fn=cmd_estimate)
     s = sub.add_parser('use'); s.add_argument('key'); s.add_argument('--branch', action='store_true'); s.set_defaults(fn=cmd_use)
     s = sub.add_parser('done'); s.add_argument('key', nargs='?'); s.set_defaults(fn=cmd_done)
     sub.add_parser('status').set_defaults(fn=cmd_status)

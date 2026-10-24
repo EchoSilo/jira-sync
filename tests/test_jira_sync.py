@@ -85,6 +85,37 @@ def test_gsd_items():
                 assert ids.index(it['parent']) < ids.index(it['id']), it['id']
 
 
+def test_plan_signals_and_score():
+    text = ('---\nautonomous: false\nfiles_modified:\n  - a.py\n  - b.py\n  - c.py\nestimate:\n  tokens: 50000\n'
+            '  tasks: 2\n  confidence: low\n---\n<task type="auto"><name>x</name></task>\n'
+            '<task type="checkpoint:human-verify"><name>y</name></task>\n')
+    s = js.plan_signals(text)
+    assert s == {'tokens': 50000, 'files': 3, 'tasks': 2, 'checkpoints': 1, 'hands_on': True, 'confidence': 'low'}
+    assert js.plan_signals('---\nfiles_modified: [a, b]\n---\n')['files'] == 2
+    bigger = dict(s, tokens=100000)
+    assert js.plan_score(bigger) > js.plan_score(s)            # more effort -> bigger
+    assert js.plan_score(dict(s, files=30)) > js.plan_score(s)  # more complexity -> bigger
+    assert js.plan_score(dict(s, checkpoints=0)) < js.plan_score(s)  # less risk -> smaller
+
+
+def test_anchor_triangulation():
+    stories = [{'id': 'p%d' % i, 'score': float(i), 'cat': 'done', 'summary': ''} for i in range(1, 21)]
+    stories.append({'id': 'open', 'score': 99.0, 'cat': 'new', 'summary': ''})
+    a = js.propose_anchors(stories)
+    assert [x['points'] for x in a] == [1, 2, 3, 5, 8]
+    assert 'open' not in [x['id'] for x in a]                   # only finished work anchors
+    assert all(b['score'] > s['score'] for s, b in zip(a, a[1:]))
+    sc = {x['points']: x['score'] for x in a}
+    assert js.size_against(sc[3], a)[0] == 3                   # equal to an anchor -> that anchor
+    assert js.size_against(sc[3] + 0.1, a)[0] == 3             # just above 3 -> closer to 3
+    assert js.size_against(sc[5] - 0.1, a)[0] == 5              # just below 5 -> closer to 5
+    assert js.size_against(-5, a)[0] == 1                       # tiny -> smallest anchor
+    gap = sc[8] - sc[5]
+    assert js.size_against(sc[8] + gap * 0.5, a)[0] == 8         # a bit past the top -> 8
+    assert js.size_against(sc[8] + gap, a)[0] == 13             # a full step past the top -> 13
+    assert js.propose_anchors(stories[:3]) == []                # too few finished stories
+
+
 def test_unrecognized():
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
