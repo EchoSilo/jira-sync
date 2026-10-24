@@ -908,6 +908,47 @@ def assign_sprints(j, sp, project, meta, have, items, out, dry=False, fresh=()):
     return warnings
 
 
+def epic_target(child_cats):
+    """Epic roll-up: every child Done -> Done; any child started or Done -> In Progress."""
+    cats = list(child_cats)
+    if cats and all(c == 'done' for c in cats):
+        return 'done'
+    if any(c in ('indeterminate', 'done') for c in cats):
+        return 'indeterminate'
+    return None
+
+
+def rollup_epics(j, project, meta, known, out, dry=False, warnings=None):
+    """Move each open epic forward to match its children (all of them, synced or not).
+    `known` overrides statuses this run just changed, since Jira's search lags."""
+    epics = {i['key']: i['fields']['status']['statusCategory']['key'] for i in j.search(
+        'project = "%s" AND issuetype = %s AND statusCategory != Done' % (project, meta['epic']), ['status'])}
+    if not epics:
+        return 0
+    children = {}
+    keys = list(epics)
+    for n in range(0, len(keys), 50):
+        for i in j.search('parent in (%s)' % ','.join(keys[n:n + 50]), ['status', 'parent']):
+            cat = known.get(i['key']) or i['fields']['status']['statusCategory']['key']
+            children.setdefault(i['fields']['parent']['key'], []).append(cat)
+    moved = 0
+    for key, cur in epics.items():
+        cur = known.get(key) or cur
+        target = epic_target(children.get(key, []))
+        if not target or CATS.index(target) <= CATS.index(cur):
+            continue
+        if dry:
+            out('would move   epic %s -> %s (children)' % (key, CAT_NAMES[target]))
+        elif j.move(key, target):
+            out('moved epic %s -> %s (its children)' % (key, CAT_NAMES[target]))
+        else:
+            if warnings is not None:
+                warnings.append('epic %s could not reach %s: no transition in the workflow' % (key, CAT_NAMES[target]))
+            continue
+        moved += 1
+    return moved
+
+
 # ---------------------------------------------------------------------- reconcile
 
 def reconcile(root, cfg, dry=False, out=print, refresh_text=False):
@@ -1043,6 +1084,10 @@ def reconcile(root, cfg, dry=False, out=print, refresh_text=False):
         warnings += assign_sprints(j, Sprints(j, project), project, meta, have, items, out, dry, fresh)
     except JiraError as e:
         warnings.append('sprint assignment failed: %s' % e)
+    try:
+        moved += rollup_epics(j, project, meta, {v['key']: v['cat'] for v in have.values()}, out, dry, warnings)
+    except JiraError as e:
+        warnings.append('epic roll-up failed: %s' % e)
     if not dry:
         write_json(git_path(root, 'jira-sync-map.json'), {k: v['key'] for k, v in have.items()})
     for w in warnings:
@@ -1329,6 +1374,7 @@ def start_issue(root, cfg, j, key, branch, summary=None):
     ok = j.move(key, 'indeterminate')
     set_active(root, key)
     print('%s is now the current issue%s' % (key, '' if ok else ' (WARNING: could not move it to In Progress)'))
+    rollup_epics(j, cfg['project'], j.project(cfg['project']), {key: 'indeterminate'} if ok else {}, print)
     if branch:
         slug = re.sub(r'[^a-z0-9]+', '-', (summary or '').lower()).strip('-')[:40]
         name = '%s-%s' % (key, slug) if slug else key
@@ -1396,10 +1442,12 @@ def cmd_done(a):
     key = a.key or active
     if not key:
         raise SystemExit('no key given and no current issue')
-    ok = Jira(cfg['site']).move(key, 'done')
+    j = Jira(cfg['site'])
+    ok = j.move(key, 'done')
     if key == active:
         active_f.unlink()
     print('%s -> Done' % key if ok else 'WARNING %s could not reach Done: no transition in the workflow' % key)
+    rollup_epics(j, cfg['project'], j.project(cfg['project']), {key: 'done'} if ok else {}, print)
     return 0 if ok else 1
 
 

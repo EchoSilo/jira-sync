@@ -89,6 +89,7 @@ Stories are sized on the Fibonacci scale **1, 2, 3, 5, 8, 13** by comparing them
     - Finished work goes into the sprint whose dates cover when it finished.
     - Work finished before the first sprint goes into "Sprint 0 (before Jira)". That sprint closes itself at the next rollover, because team-managed boards allow only one active sprint.
     - Sprints are calendar months. When the active sprint's end date passes, the next sync closes it, starts the next one (creating it if needed), and carries unfinished work over.
+- **Epic roll-up** runs after every sync, `start` and `done`, and checks every child of every open epic, including issues created by hand. If any child is In Progress or Done, the epic moves to at least In Progress. When every child is Done, the epic moves to Done. Like all moves, it is forward-only.
 - **`epics`** lists the open epics to file new work under.
 - **Auto-push (`init --auto-push on`):** after every commit the branch is pushed in the background so the GitHub for Jira app sees it. Never forces; skips mid-rebase/merge; a failed push is logged and retried on the next commit.
 - **PR hook:** after `gh pr create`, the title is prefixed with the issue key.

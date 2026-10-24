@@ -148,6 +148,15 @@ def test_site_allowed():
     os.environ.pop('JIRA_ALLOWED_HOSTS')
 
 
+def test_epic_target():
+    t = js.epic_target
+    assert t([]) is None                                   # no children: leave it
+    assert t(['new', 'new']) is None                       # nothing started
+    assert t(['new', 'indeterminate']) == 'indeterminate'  # any child started
+    assert t(['new', 'done']) == 'indeterminate'           # any child done
+    assert t(['done', 'done']) == 'done'                   # all done
+
+
 def test_short_title():
     st = js.short_title
     assert st('Task 1: Tracer -- Your bets renders from the report: counts, every leg status, direction markers') \
