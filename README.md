@@ -4,6 +4,107 @@ A Claude Code plugin that keeps a Jira project in step with a git repo. Every co
 
 It needs only the Python standard library, and nothing about a site, project or path is hardcoded. A repo opts in with one small config file.
 
+## How it works
+
+Two paths keep Jira current:
+
+- **Planning and status** go straight from your machine to Jira's API (blue).
+- **Code** (commits, branches, PRs) reaches Jira through GitHub and the **GitHub for Jira** app (green), which uses the issue key that jira-sync writes into every commit message and PR title.
+
+```mermaid
+flowchart LR
+    subgraph IDE["Your machine (IDE + Claude Code)"]
+        direction TB
+        Dev["You / Claude<br/>write code"]
+        GSD[".planning/<br/>GSD milestones, phases,<br/>plans, debug, quick tasks"]
+        Skill["/jira-sync skill<br/>start · done · estimate · sync"]
+        subgraph Hooks["git hooks (installed by init)"]
+            direction TB
+            CM["commit-msg<br/>adds [KEY] to the message"]
+            PC["post-commit<br/>background: push + reconcile"]
+        end
+        Cache[(".git/jira-sync-map.json<br/>offline key cache")]
+        Dev -->|git commit| CM --> PC
+        GSD -. read .-> PC
+        Cache -. lookup .-> CM
+    end
+
+    subgraph GH["GitHub"]
+        Repo["Repository<br/>commits · branches"]
+        PR["Pull requests<br/>title prefixed with KEY"]
+    end
+
+    subgraph JIRA["Jira"]
+        direction TB
+        Issues["Fix Version → Epic → Story → Sub-task<br/>Tasks · Bugs"]
+        Sprint["Sprints<br/>monthly, auto-roll"]
+        Points["Story points<br/>vs anchor stories"]
+        DevPanel["Development panel<br/>commits · branches · PRs"]
+    end
+
+    PC -->|git push| Repo
+    Skill -->|gh pr create → title gets KEY| PR
+    PC ==>|REST API: create · transition ·<br/>epic · sprint · points| Issues
+    Skill ==>|REST API| Issues
+    Issues --- Sprint
+    Issues --- Points
+    Issues -. labels gsd-ID rebuild .-> Cache
+    Repo -->|GitHub for Jira app<br/>matches [KEY]| DevPanel
+    PR -->|GitHub for Jira app| DevPanel
+    DevPanel --- Issues
+
+    linkStyle default stroke:#888
+    classDef api fill:#e8f0fe,stroke:#4a6fd1
+    classDef code fill:#e6f4ea,stroke:#2e8b57
+    class Issues,Sprint,Points api
+    class Repo,PR,DevPanel code
+```
+
+### What happens on one commit
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Dev as You / Claude
+    participant Git as git (local)
+    participant Hook as jira-sync hooks
+    participant GH as GitHub
+    participant App as GitHub for Jira app
+    participant Jira as Jira
+
+    Dev->>Git: git commit -m "feat(41-04): render Your bets"
+    Git->>Hook: commit-msg (staged files + message)
+    Note over Hook: offline: match staged files to the plan's<br/>task list, then look up the key in the cache
+    Hook-->>Git: "feat(41-04): render Your bets [PROJ-157]"
+    Git->>Hook: post-commit
+    Hook-->>Dev: returns at once (the rest runs in the background)
+    par code path
+        Hook->>GH: git push (never force)
+        GH->>App: push event
+        App->>Jira: commit shown on PROJ-157 (Development panel)
+    and planning path
+        Hook->>Hook: read .planning/ (plans, SUMMARY, ROADMAP, debug)
+        Hook->>Jira: REST: create missing issues, fill epics,<br/>move status forward, size stories, assign sprints
+        Jira-->>Hook: keys + labels, cache refreshed
+    end
+```
+
+### Where a GSD item ends up
+
+```mermaid
+flowchart TD
+    M["Milestone v14.0"] --> FV["Fix Version"]
+    P["Phase 41"] --> E["Epic"]
+    P --> OPS["Task: Phase 41 planning,<br/>review and verification"]
+    PL["Plan 41-04"] --> S["Story + story points"]
+    T["Plan task 1..n"] --> ST["Sub-task"]
+    D["Debug session"] --> B["Bug"]
+    Q["Quick task / todo"] --> TK["Task"]
+    E --> OPS & S & B & TK
+    S --> ST
+    S & OPS & B & TK --> SP["Sprint<br/>(active, or the one it finished in)"]
+```
+
 ## What it does
 
 | Area | Behaviour |
