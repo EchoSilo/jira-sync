@@ -233,7 +233,24 @@ def started_ids(root, n=3000):
 
 # --------------------------------------------------------------------------- Jira
 
-def env(name):
+ENV_ALIASES = {'JIRA_EMAIL': ('JIRA_EMAIL', 'JIRA_USER_EMAIL', 'JIRA_USERNAME', 'JIRA_USER', 'ATLASSIAN_EMAIL'),
+               'JIRA_API_TOKEN': ('JIRA_API_TOKEN', 'JIRA_TOKEN', 'ATLASSIAN_API_TOKEN')}
+
+
+def dotenv():
+    """KEY=value pairs from the repo-root .env, read here so values never pass through a shell."""
+    top = git('rev-parse', '--show-toplevel')
+    p = Path(top) / '.env' if top else None
+    vals = {}
+    if p and p.exists():
+        for line in p.read_text(encoding='utf-8', errors='replace').splitlines():
+            m = re.match(r'\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$', line)
+            if m:
+                vals[m.group(1)] = m.group(2).strip().strip('"\'')
+    return vals
+
+
+def _env_one(name):
     v = os.environ.get(name)
     if v or os.name != 'nt':
         return v
@@ -243,6 +260,24 @@ def env(name):
             return winreg.QueryValueEx(k, name)[0]
     except OSError:
         return None
+
+
+def env_source(name):
+    """(value, where it came from) -- environment first, then the repo's .env."""
+    names = ENV_ALIASES.get(name, (name,))
+    for n in names:
+        v = _env_one(n)
+        if v:
+            return v, 'environment %s' % n
+    dv = dotenv()
+    for n in names:
+        if dv.get(n):
+            return dv[n], '.env %s' % n
+    return None, None
+
+
+def env(name):
+    return env_source(name)[0]
 
 
 def adf(text):
@@ -352,9 +387,10 @@ def reconcile(root, cfg, dry=False, out=print):
 
     try:
         vers = j.versions(project)
-        if ms['current'] not in vers and not dry:
-            vers[ms['current']] = j.req('POST', '/rest/api/3/version', {'name': ms['current'], 'projectId': int(meta['id'])})
-            out('created fix version %s' % ms['current'])
+        if ms['current'] not in vers:
+            if not dry:
+                vers[ms['current']] = j.req('POST', '/rest/api/3/version', {'name': ms['current'], 'projectId': int(meta['id'])})
+            out('%s fix version %s' % ('would create' if dry else 'created', ms['current']))
         version_id = vers.get(ms['current'], {}).get('id')
         for name, v in vers.items():
             if name.split(' ')[0] in ms['archived'] and not v.get('released'):
@@ -381,6 +417,7 @@ def reconcile(root, cfg, dry=False, out=print):
                 created += 1
                 if it['cat'] != 'new':
                     out('would move   %-18s -> %s' % (it['id'], CAT_NAMES[it['cat']]))
+                    moved += 1
                 continue
             fields = {'project': {'key': project}, 'issuetype': {'id': type_id},
                       'summary': it['summary'][:254], 'labels': [SYNC_LABEL, 'gsd-' + it['id']],
@@ -515,7 +552,14 @@ def cmd_doctor(a):
     cfg = load_config(root)
     check(bool(cfg), 'config %s' % CONFIG, json.dumps(cfg) if cfg else 'missing, run init')
     for n in ('JIRA_EMAIL', 'JIRA_API_TOKEN'):
-        check(bool(env(n)), 'env %s' % n, 'set' if env(n) else 'not set')
+        v, src = env_source(n)
+        check(bool(v), 'credential %s' % n, 'from ' + src if v else 'not set (environment or repo .env)')
+    jira_keys = sorted(k for k in dotenv() if 'JIRA' in k.upper() or 'ATLASSIAN' in k.upper())
+    if jira_keys:
+        print('--   .env Jira-related key names: %s' % ', '.join(jira_keys))
+    url = dotenv().get('JIRA_URL') or dotenv().get('JIRA_BASE_URL') or ''
+    if cfg and url and cfg['site'] not in url:
+        print('--   NOTE .env JIRA_URL host differs from %s site %s' % (CONFIG, cfg['site']))
     hooks = git_path(root, 'hooks')
     for n in ('commit-msg', 'post-commit'):
         h = hooks / n
