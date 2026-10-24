@@ -74,10 +74,13 @@ def test_gsd_items():
         assert by['41-01']['cat'] == 'done' and by['41-01-t1']['cat'] == 'done'
         assert by['41-02']['cat'] == 'indeterminate'  # has a commit, no summary
         assert by['41-03']['cat'] == 'new'
-        assert by['41-02']['summary'] == 'Plan 41-02: Finish the tab.'
-        assert by['41-02-t2'] == {'id': '41-02-t2', 'type': 'subtask', 'summary': 'T2: Test it', 'parent': '41-02',
-                                  'cat': 'new', 'version': None, 'path': '.planning/phases/41-clv/41-02-PLAN.md'}
+        assert by['41-02']['summary'] == 'Finish the tab. More text'
+        assert by['41-02']['sections'][0] == ('Objective', 'p', 'Finish the tab. More text.')
+        t2 = by['41-02-t2']
+        assert (t2['summary'], t2['parent'], t2['cat'], t2['type']) == ('Test it', '41-02', 'new', 'subtask')
         assert by['debug-broken-thing']['summary'] == 'API returns 502' and by['debug-old-bug']['cat'] == 'done'
+        # open unplanned work goes under the current phase's epic
+        assert by['debug-broken-thing']['parent'] == '41' and by['quick-261018-ri9']['parent'] == '41'
         assert by['quick-261018-ri9']['cat'] == 'indeterminate' and by['quick-20260911-parlay']['cat'] == 'done'
         ids = [it['id'] for it in items]
         for it in items:  # parents always precede children
@@ -114,6 +117,54 @@ def test_anchor_triangulation():
     assert js.size_against(sc[8] + gap * 0.5, a)[0] == 8         # a bit past the top -> 8
     assert js.size_against(sc[8] + gap, a)[0] == 13             # a full step past the top -> 13
     assert js.propose_anchors(stories[:3]) == []                # too few finished stories
+
+
+def test_short_title():
+    st = js.short_title
+    assert st('Task 1: Tracer -- Your bets renders from the report: counts, every leg status, direction markers') \
+        == 'Your bets renders from the report'
+    assert st('Your bets, beat-vs-win, tier and sharp sections, grade-toast failure line, Playwright dev spec (wave 2)') \
+        == 'Your bets, beat-vs-win, tier and sharp sections'
+    assert st('Win-chance CLV (pick-time pull, de-vig, residual curve), tier and sharp flags') \
+        == 'Win-chance CLV, tier and sharp flags'
+    assert st('short one.') == 'Short one'
+    for s in ('a ' * 80, 'word' * 40):
+        assert len(st(s)) <= 60
+
+
+def test_epic_for_history_by_date():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        write(root, '.planning/STATE.md', '---\nmilestone: v1\ncurrent_phase: 3\n---\n')
+        write(root, '.planning/ROADMAP.md', '- [x] **Phase 1: A**\n- [x] **Phase 2: B**\n- [ ] **Phase 3: C**\n')
+        for n in (1, 2, 3):
+            write(root, '.planning/phases/%d-x/%d-CONTEXT.md' % (n, n), '')
+        write(root, '.planning/debug/resolved/mid.md', '---\ntrigger: t\n---\n')
+        write(root, '.planning/debug/resolved/early.md', '---\ntrigger: t\n---\n')
+        starts = {'1': '2026-01-01T00:00:00+00:00', '2': '2026-02-01T00:00:00+00:00', '3': '2026-03-01T00:00:00+00:00'}
+        dates = {'.planning/debug/mid.md': '2026-02-10T00:00:00+00:00', '.planning/debug/early.md': '2025-12-01T00:00:00+00:00'}
+        items, _ = js.gsd_items(root, (), dates, starts)
+        by = {it['id']: it for it in items}
+        assert by['debug-mid']['parent'] == '2'     # phase 2 was being worked on then
+        assert by['debug-early']['parent'] == '1'   # before any phase: the first one
+
+
+def test_sprint_dates():
+    import datetime as dt
+    utc = dt.timezone.utc
+    assert js.add_month(dt.datetime(2026, 11, 1, 4, tzinfo=utc)) == dt.datetime(2026, 12, 1, 4, tzinfo=utc)
+    assert js.add_month(dt.datetime(2026, 12, 1, tzinfo=utc)) == dt.datetime(2027, 1, 1, tzinfo=utc)
+    assert js.add_month(dt.datetime(2026, 1, 31, tzinfo=utc)).day == 28
+    assert js.next_sprint_name('PROJ Sprint 1') == 'PROJ Sprint 2'
+    assert js.parse_ts('2026-11-01T04:00:00.000Z') == dt.datetime(2026, 11, 1, 4, tzinfo=utc)
+    assert js.jira_ts(dt.datetime(2026, 11, 1, 4, tzinfo=utc)) == '2026-11-01T04:00:00.000Z'
+
+
+def test_adf_doc_shape():
+    doc = js.adf_doc([('Goal', 'p', 'one\n\ntwo'), ('Files', 'code', ['a.py']), ('Verify', 'pre', 'make test')], 'foot')
+    kinds = [n['type'] for n in doc['content']]
+    assert kinds == ['heading', 'paragraph', 'paragraph', 'heading', 'bulletList', 'heading', 'codeBlock', 'paragraph']
+    assert doc['content'][4]['content'][0]['content'][0]['content'][0]['marks'] == [{'type': 'code'}]
 
 
 def test_unrecognized():

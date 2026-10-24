@@ -34,9 +34,19 @@ If the repo has no `.jira-sync.json` and the user didn't ask for `init`, say Jir
    - **story**: new behaviour a user will see or use.
    - **task**: chore, refactor, docs, config, dependency or research with no user-visible change.
    - **epic**: the request will clearly need several stories. Create the epic, then its stories with `--parent <EPIC>`, and start the first one.
-3. `create --type <t> --summary "<imperative, <80 chars>" --description "<why + acceptance in 1-3 lines>" --start [--branch]`.
+3. Every story, task and bug needs an **Epic**. Run `epics` and pick the open epic the work belongs to. In a GSD repo that is usually the current phase. If none fits, create an epic first.
+4. Write the issue so a teammate could pick it up cold:
+   - **Summary:** under 70 characters, a plain title of the outcome ("Parlay cards show future timestamps"). No ids, no detail. The script refuses longer ones.
+   - **Description:** markdown-style `## ` sections, which become headings in Jira:
+     - `## Context`: why it matters or what's broken.
+     - `## Scope`: what changes, as `- ` bullets.
+     - `## Acceptance criteria`: testable bullets.
+     - `## Notes`: links, files, risks. Optional.
+     - Bugs use `## Symptoms` (expected vs actual, steps), `## Impact` and `## Acceptance criteria` instead.
+5. `create --type <t> --summary "..." --description "..." --parent <EPIC> --start [--branch]`.
+   Stories, tasks and bugs go into the active sprint automatically.
    Pass `--branch` when the repo works on feature branches (current branch isn't the default) or the user asked for one. Stay on the current branch otherwise, because the current-issue key still goes onto every commit.
-4. Report the key and link in one line.
+6. Report the key, epic, sprint and link in one line.
 
 When the work is finished (tests pass, the user is happy, or a PR was merged), run `done`. Don't close an issue on your own judgement while the user is still iterating.
 
@@ -65,7 +75,21 @@ Stories are sized on the Fibonacci scale **1, 2, 3, 5, 8, 13** by comparing them
 ## What happens automatically
 
 - **commit-msg hook:** appends ` [KEY]` to every commit subject. It uses, first match wins: a key already in the message, then a key in the branch name, then the GSD scope (`feat(41-04):` maps to that plan's story, `docs(41):` to the phase epic, `quick-…` to its task), then the current issue. It never blocks a commit.
-- **post-commit hook (GSD repos):** reconciles in the background from `.planning/` and logs to `.git/jira-sync.log`. Statuses only ever move forward, so it never reopens something a person closed.
+- **post-commit hook (GSD repos):** reconciles in the background from `.planning/` and logs to `.git/jira-sync.log`. Statuses only ever move forward, so it never reopens something a person closed. The background run follows these rules:
+  - **Text:** summaries are short titles (60 characters at most). Descriptions are built from the GSD files:
+    - epic: goal, success criteria, requirements;
+    - story: objective, outcome, scope, acceptance criteria, files;
+    - sub-task: behaviour, steps, acceptance, verify command;
+    - bug: symptoms, root cause, fix, verification.
+
+    Text is written on create only. `reconcile --refresh-text` rewrites it for every synced issue.
+  - **Epics:** bugs, quick tasks and todos go under the phase being worked on when they appeared. Open work goes under the current phase; past work is matched by date to the phase whose plans had started by then. A missing epic is filled in, but an issue someone moved by hand is never re-parented.
+  - **Sprints:** every story, task and bug sits in a sprint.
+    - Open work goes into the active sprint.
+    - Finished work goes into the sprint whose dates cover when it finished.
+    - Work finished before the first sprint goes into "Sprint 0 (before Jira)". That sprint closes itself at the next rollover, because team-managed boards allow only one active sprint.
+    - Sprints are calendar months. When the active sprint's end date passes, the next sync closes it, starts the next one (creating it if needed), and carries unfinished work over.
+- **`epics`** lists the open epics to file new work under.
 - **PR hook:** after `gh pr create`, the title is prefixed with the issue key.
 - The **GitHub for Jira** app turns those keys into the Development panel on each issue.
 

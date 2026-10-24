@@ -9,6 +9,8 @@ synced issue carries the label "jira-sync" plus "gsd-<id>", and the local cache 
 """
 import argparse
 import base64
+import calendar
+import datetime
 import json
 import math
 import os
@@ -16,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import textwrap
 import time
 import urllib.error
 import urllib.request
@@ -139,11 +142,6 @@ def first_sentence(text, limit=200):
     return s if len(s) <= limit else s[:limit - 3].rstrip() + '...'
 
 
-def _plan_summary(text, pid):
-    m = re.search(r'<objective>(.*?)</objective>', text, re.S)
-    return 'Plan %s: %s' % (pid, first_sentence(m.group(1))) if m else 'Plan %s' % pid
-
-
 # ------------------------------------------------------------ story points
 
 FIB = [1, 2, 3, 5, 8, 13]
@@ -224,15 +222,147 @@ def size_against(score, anchors):
         below['id'], below['points'], above['id'], above['points'], near['id'])
 
 
-def gsd_items(root, started_ids=()):
+def short_title(text, limit=60):
+    """A Jira-sized title: parentheticals dropped, cut at the strongest clause boundary
+    that fits (topic break, then semicolon, then comma), never mid-word, no ellipsis."""
+    t = ' '.join(re.sub(r'\s*\([^)]*\)', '', text or '').split()).strip(' .')
+    t = re.sub(r'^(?:Task \d+:\s*|Plan [\d.]+-\d+:\s*|Tracer\s*--\s*)+', '', t)
+    if t.split(' ')[0].isalpha():
+        t = t[:1].upper() + t[1:]
+    if len(t) <= limit:
+        return t
+    head, out = t[:limit + 1], None
+    for seps, floor in (((': ', ' -- ', ' \u2014 '), 15), (('; ',), 25), ((', ', ' - '), limit // 2)):
+        pos = max(head.rfind(s) for s in seps)
+        if pos >= floor:
+            out = t[:pos]
+            break
+    if out is None:  # no clause break: cut at a word, and not on a dangling little word
+        out = head[:head.rfind(' ')] if ' ' in head else t[:limit]
+        out = re.sub(r'(?:\s+(?:the|a|an|of|in|to|and|or|for|with|when|on|at|by|is|are))+$', '', out, flags=re.I)
+    if out.count('"') % 2:
+        out = out[:out.rfind('"')]  # never end inside a quotation
+    return out.strip(' .,;:-')
+
+
+def tag(text, name):
+    m = re.search(r'<%s\b[^>]*>(.*?)</%s>' % (name, name), text or '', re.S)
+    return textwrap.dedent(m.group(1)).strip() if m else ''
+
+
+def yaml_list(text, key):
+    """Items of `key:` as a block list (any indent) or an inline [a, b] list."""
+    m = re.search(r'^([ \t]*)%s:[ \t]*\[(.*?)\]' % re.escape(key), text, re.M)
+    if m:
+        return [x.strip().strip('"\'') for x in m.group(2).split(',') if x.strip()]
+    m = re.search(r'^([ \t]*)%s:[ \t]*\n((?:\1[ \t]+-.*(?:\n|$))+)' % re.escape(key), text, re.M)
+    return [x.strip().strip('"\'').replace('\\"', '"') for x in re.findall(r'^[ \t]+-[ \t]+(.*)$', m.group(2), re.M)] if m else []
+
+
+def bullets(text):
+    """Markdown '- ' lines as a list, or None when the text is prose."""
+    items = re.findall(r'^\s*[-*]\s+(.*)$', text or '', re.M)
+    return items if items and len(items) >= len([l for l in (text or '').splitlines() if l.strip()]) / 2 else None
+
+
+def md_sections(text):
+    """{heading: body} for every '## heading' block in a markdown file."""
+    parts = re.split(r'^##\s+(.+?)\s*$', text, flags=re.M)
+    return {parts[i].strip(): parts[i + 1].strip() for i in range(1, len(parts) - 1, 2)}
+
+
+def body_after_frontmatter(text):
+    return re.sub(r'\A---\r?\n.*?\r?\n---\r?\n?', '', text, flags=re.S)
+
+
+def _sec(heading, value, kind=None):
+    """One description section; kind inferred: list -> bullets, text with '- ' lines -> bullets, else prose."""
+    if not value:
+        return None
+    if kind is None:
+        kind = 'ul' if isinstance(value, list) else 'p'
+        if kind == 'p' and bullets(value):
+            value, kind = bullets(value), 'ul'
+    return (heading, kind, value)
+
+
+def epic_sections(roadmap, num):
+    m = re.search(r'^###\s+Phase %s:.*?$(.*?)(?=^###?\s|\Z)' % re.escape(num), roadmap, re.M | re.S)
+    block = m.group(1) if m else ''
+    field = lambda name: (re.search(r'\*\*%s\*\*:?\s*(.+)' % name, block) or [None, ''])[1].strip()
+    criteria = re.findall(r'^\s+\d+\.\s+(.+)$', block, re.M)
+    return [s for s in (_sec('Goal', field('Goal')), _sec('Success criteria', criteria, 'ol'),
+                        _sec('Requirements', field('Requirements')), _sec('Depends on', field('Depends on'))) if s]
+
+
+def story_sections(text, summary_text=''):
+    head = (re.match(r'---\r?\n(.*?)\r?\n---', text, re.S) or [None, ''])[1]
+    tasks = [short_title(n, 120) for n in re.findall(r'<task\b[^>]*>\s*<name>(.*?)</name>', text, re.S)]
+    outcome = (re.search(r'^\*\*(.+?)\*\*\s*$', body_after_frontmatter(summary_text), re.M) or [None, ''])[1]
+    details = '; '.join(x for x in (
+        'Requirements: ' + ', '.join(yaml_list(head, 'requirements')) if yaml_list(head, 'requirements') else '',
+        'Depends on: ' + ', '.join(yaml_list(head, 'depends_on')) if yaml_list(head, 'depends_on') else '',
+        'Wave ' + (re.search(r'^wave:\s*(\S+)', head, re.M) or [None, ''])[1] if re.search(r'^wave:', head, re.M) else '') if x)
+    return [s for s in (_sec('Objective', tag(text, 'objective'), 'p'), _sec('Outcome', outcome),
+                        _sec('Scope', tasks), _sec('Acceptance criteria', yaml_list(head, 'truths')),
+                        _sec('Files', yaml_list(head, 'files_modified'), 'code'), _sec('Details', details)) if s]
+
+
+def subtask_sections(block):
+    files = [f.strip() for f in tag(block, 'files').split(',') if f.strip()]
+    return [s for s in (_sec('Behaviour', tag(block, 'behavior')), _sec('What to do', tag(block, 'action')),
+                        _sec('Acceptance criteria', tag(block, 'acceptance_criteria')),
+                        _sec('Verify', tag(block, 'automated') or tag(block, 'verify'), 'pre'),
+                        _sec('Done when', tag(block, 'done')), _sec('Files', files, 'code')) if s]
+
+
+def bug_sections(text):
+    secs = md_sections(text)
+    res = secs.get('Resolution', '')
+    val = lambda k: (re.search(r'^%s:\s*"?(.*?)"?\s*$' % k, res, re.M) or [None, ''])[1].replace('\\"', '"')
+    return [s for s in (_sec('Symptoms', secs.get('Symptoms', '')), _sec('Root cause', val('root_cause')),
+                        _sec('Fix', val('fix')), _sec('Verification', val('verification'))) if s]
+
+
+# ------------------------------------------------------------------ git dates
+
+def git_add_dates(root):
+    """{repo-relative path: ISO date it was first committed} for files under .planning/."""
+    out, when = {}, None
+    for line in git('log', '--diff-filter=A', '--name-only', '--format=@@%aI', '--', '.planning', cwd=root).splitlines():
+        if line.startswith('@@'):
+            when = line[2:]
+        elif line.strip():
+            out[line.strip()] = when  # log is newest first, so the last write is the earliest add
+    return out
+
+
+def phase_starts(root):
+    """{phase number: ISO date of its first plan commit} -- when work (not planning) on it began."""
+    out = {}
+    for line in git('log', '--format=%aI%x09%s', cwd=root).splitlines():
+        when, _, subj = line.partition('\t')
+        ids = scope_ids(subj)
+        if len(ids) == 2:
+            out[ids[-1]] = when  # newest first -> ends on the earliest
+    return out
+
+
+def parse_ts(s):
+    """ISO timestamp (git %aI or Jira's ...000Z) -> aware datetime."""
+    return datetime.datetime.fromisoformat(re.sub(r'\.\d+', '', s).replace('Z', '+00:00')) if s else None
+
+
+def gsd_items(root, started_ids=(), add_dates=None, starts=None):
     """Desired Jira items derived from .planning/, parents before children.
 
-    Each item: {id, type, summary, parent, cat, version, path}.
-    Returns ([], None) when the repo has no .planning/ directory.
+    Each item: {id, type, summary, parent, cat, version, path, sections, created_at, done_at}
+    (+ signals/score on stories). Returns ([], None) when there is no .planning/ directory.
     """
     pl = root / '.planning'
     if not pl.is_dir():
         return [], None
+    add_dates, starts = add_dates or {}, starts or {}
     state_md = pl / 'STATE.md'
     roadmap_md = pl / 'ROADMAP.md'
     if not state_md.exists() or not roadmap_md.exists() or not (pl / 'phases').is_dir():
@@ -246,62 +376,100 @@ def gsd_items(root, started_ids=()):
     checked = {}
     for m in re.finditer(r'^- \[( |x)\] \**Phase ([\d.]+): (.+?)(?:\*\*|\s+-\s|\s+\(|$)', roadmap, re.M):
         checked[m.group(2)] = (m.group(1) == 'x', m.group(3).strip())
+    plan_lines = {m.group(1): m.group(2) for m in re.finditer(
+        r'^\s*- \[[ x]\] ([\d.]+-\d+)-PLAN\.md\s+[\u2014-]+\s+(.+)$', roadmap, re.M)}
+    rel = lambda p: p.relative_to(root).as_posix()
     started = set(started_ids)
-    items = []
+    items, phases = [], []
     for d in sorted((pl / 'phases').iterdir(), key=lambda p: [int(x) if x.isdigit() else 0 for x in re.split(r'[.-]', p.name.split('-')[0])]):
         m = re.match(r'(\d+(?:\.\d+)*)-(.+)', d.name)
         if not d.is_dir() or not m or m.group(1).startswith('999'):
             continue  # 999.x = backlog, not scheduled work
         num, slug = m.group(1), m.group(2)
         done, name = checked.get(num, (False, slug.replace('-', ' ').title()))
-        phase = {'id': num, 'type': 'epic', 'summary': 'Phase %s: %s' % (num, name),
-                 'parent': None, 'version': version, 'path': d.relative_to(root).as_posix()}
+        phases.append(num)
+        phase = {'id': num, 'type': 'epic', 'summary': 'Phase %s: %s' % (num, short_title(name, 50)),
+                 'parent': None, 'version': version, 'path': rel(d),
+                 'sections': epic_sections(roadmap, num), 'created_at': starts.get(num), 'done_at': None}
         # A phase-scoped commit is planning (docs(40): create phase plan), not work.
         children, any_started = [], num == current
         for p in sorted(d.glob('%s-*-PLAN.md' % num)):
             pid = p.name[:-len('-PLAN.md')]
             text = p.read_text(encoding='utf-8')
             summ = p.with_name(pid + '-SUMMARY.md')
-            pdone = summ.exists() and frontmatter(summ.read_text(encoding='utf-8')).get('status', 'complete') == 'complete'
+            stext = summ.read_text(encoding='utf-8') if summ.exists() else ''
+            pdone = bool(stext) and frontmatter(stext).get('status', 'complete') == 'complete'
             pstart = pdone or pid in started
             any_started = any_started or pstart
             cat = 'done' if pdone else 'indeterminate' if pstart else 'new'
+            stitle = (re.search(r'^#\s+Phase [\d.]+ Plan \d+:\s*(.+?)(?:\s+Summary)?\s*$', stext, re.M) or [None, ''])[1]
+            title = stitle or plan_lines.get(pid) or tag(text, 'objective') or 'Plan %s' % pid
             sig = plan_signals(text)
-            children.append({'id': pid, 'type': 'story', 'summary': _plan_summary(text, pid),
-                             'parent': num, 'cat': cat, 'version': version,
-                             'path': p.relative_to(root).as_posix(),
+            children.append({'id': pid, 'type': 'story', 'summary': short_title(title),
+                             'parent': num, 'cat': cat, 'version': version, 'path': rel(p),
+                             'sections': story_sections(text, stext),
+                             'created_at': add_dates.get(rel(p)), 'done_at': add_dates.get(rel(summ)) if pdone else None,
                              'signals': sig, 'score': plan_score(sig)})
-            for i, tname in enumerate(re.findall(r'<task\b[^>]*>\s*<name>(.*?)</name>', text, re.S), 1):
-                tname = re.sub(r'^Task \d+:\s*', '', ' '.join(tname.split()))
+            for i, block in enumerate(re.findall(r'<task\b[^>]*>.*?</task>', text, re.S), 1):
                 children.append({'id': '%s-t%d' % (pid, i), 'type': 'subtask',
-                                 'summary': 'T%d: %s' % (i, first_sentence(tname, 200)),
+                                 'summary': short_title(tag(block, 'name')) or 'Task %d' % i,
                                  'parent': pid, 'cat': 'done' if pdone else 'new',
-                                 'version': None, 'path': p.relative_to(root).as_posix()})
+                                 'version': None, 'path': rel(p), 'sections': subtask_sections(block),
+                                 'created_at': None, 'done_at': None})
         phase['cat'] = 'done' if done else 'indeterminate' if any_started else 'new'
         items.append(phase)
         items.extend(children)
 
+    def epic_for(created_at, is_open):
+        """The phase being worked on when the item appeared: the current phase for open
+        work, else the latest phase that had started by then (the first phase if none had)."""
+        if not phases:
+            return None
+        if is_open and current in phases:
+            return current
+        t = parse_ts(created_at)
+        began = [(parse_ts(starts[p]), p) for p in phases if starts.get(p)]
+        prior = [x for x in began if t and x[0] <= t]
+        return max(prior)[1] if prior else (current if current in phases and not t else phases[0])
+
     # Work items that live outside phases.
     for sub, cat in (('debug', 'indeterminate'), ('debug/resolved', 'done')):
         for f in sorted((pl / sub).glob('*.md')) if (pl / sub).is_dir() else []:
-            trig = frontmatter(f.read_text(encoding='utf-8')).get('trigger') or f.stem.replace('-', ' ')
-            items.append({'id': 'debug-' + f.stem, 'type': 'bug', 'summary': first_sentence(trig, 200),
-                          'parent': None, 'cat': cat, 'version': version, 'path': f.relative_to(root).as_posix()})
+            text = f.read_text(encoding='utf-8')
+            trig = frontmatter(text).get('trigger') or f.stem.replace('-', ' ')
+            created = add_dates.get('.planning/debug/%s.md' % f.stem) or add_dates.get(rel(f))
+            items.append({'id': 'debug-' + f.stem, 'type': 'bug', 'summary': short_title(trig),
+                          'parent': epic_for(created, cat != 'done'), 'cat': cat, 'version': version,
+                          'path': rel(f), 'sections': bug_sections(text), 'created_at': created,
+                          'done_at': add_dates.get(rel(f)) if cat == 'done' else None})
     qdir = pl / 'quick'
     for q in sorted(qdir.iterdir()) if qdir.is_dir() else []:
         if not q.is_dir():
             continue
         m = re.match(r'(\d{6}-[a-z0-9]{3})-(.+)', q.name)
-        qid, slug = (m.group(1), m.group(2)) if m else (q.name, q.name)
-        done = any(q.glob('*SUMMARY.md'))
-        items.append({'id': 'quick-' + qid, 'type': 'task', 'summary': 'Quick: ' + slug.replace('-', ' '),
-                      'parent': None, 'cat': 'done' if done else 'indeterminate', 'version': version,
-                      'path': q.relative_to(root).as_posix()})
+        qid, slug = (m.group(1), m.group(2)) if m else (q.name, re.sub(r'^\d{6,8}-', '', q.name))
+        plan = next(iter(sorted(q.glob('*PLAN.md'))), None)
+        summ = next(iter(sorted(q.glob('*SUMMARY.md'))), None)
+        ptext = plan.read_text(encoding='utf-8') if plan else ''
+        stext = summ.read_text(encoding='utf-8') if summ else ''
+        heading = (re.search(r'^#\s+(.+)$', stext, re.M) or [None, ''])[1].strip()
+        heading = '' if heading.lower() in ('summary', 'quick task summary') else heading
+        title = tag(ptext, 'objective') or heading or slug.replace('-', ' ')
+        created = min((add_dates[rel(x)] for x in q.iterdir() if rel(x) in add_dates), default=None)
+        secs = story_sections(ptext, stext) if ptext else [s for s in (_sec('Outcome', body_after_frontmatter(stext)[:1500]),) if s]
+        items.append({'id': 'quick-' + qid, 'type': 'task', 'summary': short_title(first_sentence(title, 400)),
+                      'parent': epic_for(created, not summ), 'cat': 'done' if summ else 'indeterminate',
+                      'version': version, 'path': rel(q), 'sections': secs, 'created_at': created,
+                      'done_at': add_dates.get(rel(summ)) if summ else None})
     for sub, cat in (('todos/pending', 'new'), ('todos/completed', 'done')):
         for f in sorted((pl / sub).glob('*.md')) if (pl / sub).is_dir() else []:
-            title = frontmatter(f.read_text(encoding='utf-8')).get('title') or f.stem.replace('-', ' ')
-            items.append({'id': 'todo-' + f.stem, 'type': 'task', 'summary': 'Todo: ' + first_sentence(title, 200),
-                          'parent': None, 'cat': cat, 'version': version, 'path': f.relative_to(root).as_posix()})
+            text = f.read_text(encoding='utf-8')
+            title = frontmatter(text).get('title') or f.stem.replace('-', ' ')
+            created = add_dates.get('.planning/todos/pending/%s.md' % f.stem) or add_dates.get(rel(f))
+            items.append({'id': 'todo-' + f.stem, 'type': 'task', 'summary': short_title(title),
+                          'parent': epic_for(created, cat != 'done'), 'cat': cat, 'version': version,
+                          'path': rel(f), 'sections': [s for s in (_sec('Details', body_after_frontmatter(text).strip()[:3000]),) if s],
+                          'created_at': created, 'done_at': add_dates.get(rel(f)) if cat == 'done' else None})
     archived = {f.name.split('-ROADMAP.md')[0] for f in (pl / 'milestones').glob('*-ROADMAP.md')} if (pl / 'milestones').is_dir() else set()
     return items, {'current': version, 'archived': archived}
 
@@ -312,6 +480,10 @@ def started_ids(root, n=3000):
     for subj in git('log', '--format=%s', '-n', str(n), cwd=root).splitlines():
         out.update(scope_ids(subj))
     return out
+
+
+def load_items(root):
+    return gsd_items(root, started_ids(root), git_add_dates(root), phase_starts(root))
 
 
 # --------------------------------------------------------------------------- Jira
@@ -440,12 +612,13 @@ class Jira:
     def synced(self, project, points_field=None):
         """{gsd_id: {key, cat, points}} for every issue jira-sync created in this project."""
         have = {}
-        fields = ['labels', 'status'] + ([points_field] if points_field else [])
+        fields = ['labels', 'status', 'parent'] + ([points_field] if points_field else [])
         for i in self.search('project = "%s" AND labels = "%s"' % (project, SYNC_LABEL), fields):
             for label in i['fields']['labels']:
                 if label.startswith('gsd-'):
                     have[label[4:]] = {'key': i['key'], 'cat': i['fields']['status']['statusCategory']['key'],
-                                       'points': i['fields'].get(points_field) if points_field else None}
+                                       'points': i['fields'].get(points_field) if points_field else None,
+                                       'parent': (i['fields'].get('parent') or {}).get('key')}
         return have
 
     def category(self, key):
@@ -472,11 +645,222 @@ def pick_transition(options, target):
     return next((t for t in options if t.get('to', {}).get('statusCategory', {}).get('key') == target), None)
 
 
+def _t(text, code=False):
+    node = {'type': 'text', 'text': text[:3000]}
+    if code:
+        node['marks'] = [{'type': 'code'}]
+    return node
+
+
+def adf_doc(sections, footer):
+    """Atlassian document from [(heading, kind, value)]; kind: p | ul | ol | code | pre."""
+    content = []
+    for heading, kind, value in sections:
+        content.append({'type': 'heading', 'attrs': {'level': 3}, 'content': [_t(heading)]})
+        if kind == 'p':
+            for para in re.split(r'\n\s*\n', value.strip()):
+                if para.strip():
+                    content.append({'type': 'paragraph', 'content': [_t(' '.join(para.split()))]})
+        elif kind == 'pre':
+            content.append({'type': 'codeBlock', 'content': [_t(value.strip())]})
+        else:
+            items = [x for x in value if str(x).strip()][:30]
+            content.append({'type': 'orderedList' if kind == 'ol' else 'bulletList', 'content': [
+                {'type': 'listItem', 'content': [{'type': 'paragraph', 'content': [_t(str(x).strip(), kind == 'code')]}]}
+                for x in items]})
+    content.append({'type': 'paragraph', 'content': [{'type': 'text', 'text': footer, 'marks': [{'type': 'em'}]}]})
+    return {'type': 'doc', 'version': 1, 'content': content}
+
+
+def item_description(it):
+    label = {'epic': 'GSD phase', 'story': 'GSD plan', 'subtask': 'GSD plan task', 'bug': 'GSD debug session',
+             'task': 'GSD quick task / todo'}.get(it['type'], 'GSD item')
+    return adf_doc(it.get('sections') or [], '%s %s -- source %s -- synced by jira-sync' % (label, it['id'], it['path']))
+
+
+# --------------------------------------------------------------------- sprints
+
+HISTORY_SPRINT = 'Sprint 0 (before Jira)'
+
+
+def add_month(dt):
+    y, m = (dt.year + 1, 1) if dt.month == 12 else (dt.year, dt.month + 1)
+    return dt.replace(year=y, month=m, day=min(dt.day, calendar.monthrange(y, m)[1]))
+
+
+def next_sprint_name(name):
+    m = re.search(r'(\d+)\s*$', name)
+    return name[:m.start()] + str(int(m.group(1)) + 1) if m else name + ' 2'
+
+
+def jira_ts(dt):
+    return dt.astimezone(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+
+
+class Sprints:
+    """The project's sprint board: find it, keep a sprint running, add issues to sprints."""
+
+    def __init__(self, j, project):
+        self.j, self.board, self.sprints = j, None, []
+        for b in j.req('GET', '/rest/agile/1.0/board?projectKeyOrId=%s' % project).get('values', []):
+            try:
+                self.sprints = self._list(b['id'])
+                self.board = b['id']
+                break
+            except JiraError:
+                continue  # board without sprints
+
+    def _list(self, board):
+        out, start = [], 0
+        while True:
+            r = self.j.req('GET', '/rest/agile/1.0/board/%s/sprint?startAt=%d' % (board, start))
+            out.extend(r.get('values', []))
+            if r.get('isLast', True):
+                return out
+            start += len(r.get('values', []))
+
+    def by_state(self, state):
+        return sorted((s for s in self.sprints if s['state'] == state and s['name'] != HISTORY_SPRINT),
+                      key=lambda s: s.get('startDate') or s['name'])
+
+    def history(self):
+        return next((s for s in self.sprints if s['name'] == HISTORY_SPRINT), None)
+
+    def _update(self, sid, **fields):
+        r = self.j.req('POST', '/rest/agile/1.0/sprint/%s' % sid, fields)
+        for s in self.sprints:
+            if s['id'] == sid:
+                s.update(r or fields)
+        return r
+
+    def _create(self, name, start, end):
+        s = self.j.req('POST', '/rest/agile/1.0/sprint', {'name': name, 'originBoardId': self.board,
+                                                          'startDate': jira_ts(start), 'endDate': jira_ts(end)})
+        self.sprints.append(s)
+        return s
+
+    def add(self, sid, keys):
+        for i in range(0, len(keys), 50):
+            self.j.req('POST', '/rest/agile/1.0/sprint/%s/issue' % sid, {'issues': keys[i:i + 50]})
+
+    def ensure_active(self, out, dry=False):
+        """Keep exactly one calendar-month sprint running; roll over any that have ended,
+        carrying unfinished work into the next one. Returns the active sprint or None."""
+        if not self.board:
+            return None
+        now = datetime.datetime.now(datetime.timezone.utc)
+        active = (self.by_state('active') or [None])[0]
+        while active and parse_ts(active.get('endDate')) and parse_ts(active['endDate']) <= now:
+            old_end = parse_ts(active['endDate'])
+            nxt = (self.by_state('future') or [None])[0]
+            if dry:
+                out('would close %s and start %s' % (active['name'], nxt['name'] if nxt else next_sprint_name(active['name'])))
+                return active
+            carry = [i['key'] for i in self.j.search('sprint = %s AND statusCategory != Done AND issuetype not in subTaskIssueTypes()'
+                                                     % active['id'], ['summary'])]
+            if not nxt:
+                nxt = self._create(next_sprint_name(active['name']), old_end, add_month(old_end))
+            self._update(active['id'], state='closed')
+            out('closed sprint %s' % active['name'])
+            self.close_history(out)
+            start = parse_ts(nxt.get('startDate')) or old_end
+            self._update(nxt['id'], state='active', startDate=jira_ts(start),
+                         endDate=nxt.get('endDate') or jira_ts(add_month(start)))
+            out('started sprint %s' % nxt['name'])
+            if carry:
+                self.add(nxt['id'], carry)
+                out('carried %d unfinished issues into %s' % (len(carry), nxt['name']))
+            active = nxt
+        if not active:
+            nxt = (self.by_state('future') or [None])[0]
+            if dry:
+                out('would start %s' % (nxt['name'] if nxt else 'a new monthly sprint'))
+                return None
+            self.close_history(out)
+            if not nxt:
+                start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                nxt = self._create('Sprint 1', start, add_month(start))
+            start = parse_ts(nxt.get('startDate')) or now
+            self._update(nxt['id'], state='active', startDate=jira_ts(start),
+                         endDate=nxt.get('endDate') or jira_ts(add_month(start)))
+            out('started sprint %s' % nxt['name'])
+            active = nxt
+        return active
+
+    def close_history(self, out):
+        """Team-managed boards allow one active sprint, so the history sprint is filled
+        while still 'future' and started+closed at the next moment nothing else is active."""
+        h = self.history()
+        if h and h['state'] == 'future':
+            self._update(h['id'], state='active', startDate=h['startDate'], endDate=h['endDate'])
+            self._update(h['id'], state='closed')
+            out('closed %s' % HISTORY_SPRINT)
+
+    def ensure_history(self, first_start, earliest):
+        h = self.history()
+        if not h:
+            h = self._create(HISTORY_SPRINT, earliest, first_start)
+        return h
+
+
+def assign_sprints(j, sp, project, meta, have, items, out, dry=False):
+    """Every Story/Task/Bug sits in a sprint: open work in the active sprint, finished work
+    in the sprint whose dates cover when it finished, pre-Jira work in the history sprint."""
+    warnings = []
+    if not sp.board:
+        return ['no sprint board found for %s -- stories, tasks and bugs left out of sprints' % project]
+    active = sp.ensure_active(out, dry)
+    if not active:
+        return warnings + ['no active sprint -- items stay in the backlog until one exists']
+    types = ','.join(str(meta[t]) for t in ('story', 'task', 'bug') if meta.get(t))
+    loose = j.search('project = "%s" AND labels = "%s" AND issuetype in (%s) AND sprint is EMPTY'
+                     % (project, SYNC_LABEL, types), ['labels'])
+    by_key = {v['key']: gid for gid, v in have.items()}
+    item_by_id = {it['id']: it for it in items}
+    real = sp.by_state('active') + sp.by_state('future') + sp.by_state('closed')
+    first_start = min((parse_ts(s['startDate']) for s in real if s.get('startDate')), default=None)
+    plan, skipped = {}, 0
+    for i in loose:
+        it = item_by_id.get(by_key.get(i['key']))
+        done_at = parse_ts(it['done_at']) if it and it.get('done_at') else None
+        target = active
+        if done_at and first_start and done_at < first_start:
+            target = 'history'
+        elif done_at:
+            cover = next((s for s in real if s.get('startDate') and parse_ts(s['startDate']) <= done_at
+                          < parse_ts(s.get('endDate') or s['startDate'])), None)
+            if cover and cover['state'] == 'closed':
+                skipped += 1  # Jira does not accept issues into a closed sprint
+                continue
+            target = cover or active
+        plan.setdefault('history' if target == 'history' else target['id'], []).append(i['key'])
+    if 'history' in plan:
+        earliest = min(parse_ts(item_by_id[by_key[k]]['done_at']) for k in plan['history'])
+        if dry:
+            out('would put %d issues finished before %s into %s' % (len(plan['history']), first_start.date(), HISTORY_SPRINT))
+        else:
+            h = sp.ensure_history(first_start, earliest)
+            plan[h['id']] = plan.pop('history')
+            if h['state'] == 'future':
+                warnings.append('%s holds %d pre-Jira issues; it closes itself at the next sprint rollover '
+                                '(team-managed boards allow one active sprint)' % (HISTORY_SPRINT, len(plan[h['id']])))
+    names = {s['id']: s['name'] for s in sp.sprints}
+    for sid, keys in plan.items():
+        if sid == 'history':
+            continue
+        if not dry:
+            sp.add(sid, keys)
+        out('%s %d issues to sprint %s' % ('would add' if dry else 'added', len(keys), names.get(sid, sid)))
+    if skipped:
+        warnings.append('%d finished issues belong to already-closed sprints and were left out' % skipped)
+    return warnings
+
+
 # ---------------------------------------------------------------------- reconcile
 
-def reconcile(root, cfg, dry=False, out=print):
+def reconcile(root, cfg, dry=False, out=print, refresh_text=False):
     project = cfg['project']
-    items, ms = gsd_items(root, started_ids(root))
+    items, ms = load_items(root)
     if ms is None:
         out('no .planning/ directory -- nothing to reconcile (use start/done for non-GSD work)')
         return 0
@@ -484,7 +868,7 @@ def reconcile(root, cfg, dry=False, out=print):
     meta = j.project(project)
     pf = meta['points']
     have = j.synced(project, pf)
-    version_id, created, moved, sized, warnings = None, 0, 0, 0, []
+    version_id, created, moved, sized, fixed, warnings = None, 0, 0, 0, 0, []
     anchors = (cfg.get('estimation') or {}).get('anchors') or []
     if any(it['type'] == 'story' for it in items):
         if not pf:
@@ -519,19 +903,21 @@ def reconcile(root, cfg, dry=False, out=print):
         if not type_id:
             warnings.append('%s %s skipped: project %s has no %s issue type' % (it['type'], it['id'], project, it['type']))
             continue
+        if it['type'] in ('story', 'task', 'bug') and not it['parent']:
+            warnings.append('%s %s has no epic to go under (no phases in this milestone)' % (it['type'], it['id']))
+        parent = have.get(it['parent']) if it['parent'] else None
         cur = have.get(it['id'])
         if not cur:
-            parent = have.get(it['parent']) if it['parent'] else None
             if it['parent'] and not parent:
                 warnings.append('%s skipped: parent %s was not created' % (it['id'], it['parent']))
                 continue
             pts, note = size(it)
             if dry:
-                out('would create %-7s %-18s %s' % (it['type'], it['id'], it['summary'][:80]))
-                have[it['id']] = {'key': '(new %s)' % it['id'], 'cat': 'new', 'points': pts}
+                out('would create %-7s %-18s %s' % (it['type'], it['id'], it['summary']))
+                have[it['id']] = {'key': '(new %s)' % it['id'], 'cat': 'new', 'points': pts, 'parent': parent and parent['key']}
                 created += 1
                 if pts:
-                    out('would size   %-18s %d pts -- %s' % (it['id'], pts, note.split(': ', 1)[1].split('. Signals')[0]))
+                    out('would size   %-18s %d pts' % (it['id'], pts))
                     sized += 1
                 if it['cat'] != 'new':
                     out('would move   %-18s -> %s' % (it['id'], CAT_NAMES[it['cat']]))
@@ -539,7 +925,7 @@ def reconcile(root, cfg, dry=False, out=print):
                 continue
             fields = {'project': {'key': project}, 'issuetype': {'id': type_id},
                       'summary': it['summary'][:254], 'labels': [SYNC_LABEL, 'gsd-' + it['id']],
-                      'description': adf('GSD item %s\nSource: %s' % (it['id'], it['path']))}
+                      'description': item_description(it)}
             if parent:
                 fields['parent'] = {'key': parent['key']}
             if it['version'] and version_id:
@@ -555,25 +941,39 @@ def reconcile(root, cfg, dry=False, out=print):
                 del fields['fixVersions']  # field not on this issue type's screen
                 key = j.req('POST', '/rest/api/3/issue', {'fields': fields})['key']
                 warnings.append('%s created without fix version: %s' % (key, e))
-            cur = have[it['id']] = {'key': key, 'cat': 'new', 'points': pts}
+            cur = have[it['id']] = {'key': key, 'cat': 'new', 'points': pts, 'parent': parent and parent['key']}
             created += 1
             out('created %s %s (%s)%s' % (key, it['id'], it['type'], ' %d pts' % pts if pts else ''))
             if pts:
                 j.comment(key, note)
                 sized += 1
-        elif cur.get('points') is None:
-            # Existing story with no points yet: size it. Points a person set are never overwritten.
-            pts, note = size(it)
-            if pts and dry:
-                out('would size   %-18s %s %d pts' % (it['id'], cur['key'], pts))
-                sized += 1
-            elif pts:
-                j.req('PUT', '/rest/api/3/issue/%s' % cur['key'],
-                      {'fields': {pf: pts}, 'update': {'labels': [{'add': AUTO_LABEL}]}})
-                j.comment(cur['key'], note)
-                cur['points'] = pts
-                sized += 1
-                out('sized %s %s -> %d pts' % (cur['key'], it['id'], pts))
+        else:
+            update, labels = {}, []
+            if refresh_text:
+                update.update(summary=it['summary'][:254], description=item_description(it))
+            if parent and not cur.get('parent') and it['type'] != 'subtask':
+                update['parent'] = {'key': parent['key']}  # only fills a missing epic; never re-parents
+            pts, note = size(it) if cur.get('points') is None else (None, None)
+            if pts:
+                update[pf] = pts  # points a person set are never overwritten
+                labels = [{'add': AUTO_LABEL}]
+            if update:
+                if dry:
+                    out('would update %-18s %s %s' % (it['id'], cur['key'], ', '.join(
+                        'points=%d' % pts if k == pf else 'epic=%s' % parent['key'] if k == 'parent' else k for k in update)))
+                else:
+                    j.req('PUT', '/rest/api/3/issue/%s' % cur['key'], {'fields': update, 'update': {'labels': labels}} if labels
+                          else {'fields': update})
+                    if pts:
+                        j.comment(cur['key'], note)
+                    out('updated %s %s (%s)' % (cur['key'], it['id'], ', '.join(
+                        'points' if k == pf else 'epic' if k == 'parent' else k for k in update)))
+                if 'parent' in update:
+                    cur['parent'] = parent['key']
+                    fixed += 1
+                if pts:
+                    cur['points'] = pts
+                    sized += 1
         if CATS.index(it['cat']) > CATS.index(cur['cat']):
             if dry:
                 out('would move   %-18s %s -> %s' % (it['id'], cur['key'], CAT_NAMES[it['cat']]))
@@ -584,12 +984,17 @@ def reconcile(root, cfg, dry=False, out=print):
                 continue
             moved += 1
             cur['cat'] = it['cat']
+    try:
+        warnings += assign_sprints(j, Sprints(j, project), project, meta, have, items, out, dry)
+    except JiraError as e:
+        warnings.append('sprint assignment failed: %s' % e)
     if not dry:
         write_json(git_path(root, 'jira-sync-map.json'), {k: v['key'] for k, v in have.items()})
     for w in warnings:
         out('WARNING ' + w)
-    out(('dry run: %d to create, %d to move, %d to size' if dry else 'done: %d created, %d moved, %d sized')
-        % (created, moved, sized) + ', %d warnings' % len(warnings))
+    out(('dry run: %d to create, %d to move, %d to size, %d to put under an epic' if dry
+         else 'done: %d created, %d moved, %d sized, %d put under an epic') % (created, moved, sized, fixed)
+        + ', %d warnings' % len(warnings))
     return 1 if warnings else 0
 
 
@@ -610,6 +1015,7 @@ def locked_reconcile(root, cfg):
             def out(line):
                 fh.write('%s %s\n' % (time.strftime('%Y-%m-%d %H:%M:%S'), line))
                 fh.flush()
+                os.utime(lock)  # a long run keeps its lock fresh so it is never judged stale
             while True:
                 if dirty.exists():
                     dirty.unlink()
@@ -718,7 +1124,7 @@ def cmd_doctor(a):
         except JiraError as e:
             check(False, 'jira', str(e))
     try:
-        items, ms = gsd_items(root, started_ids(root))
+        items, ms = load_items(root)
         if ms is None:
             print('--   no .planning/ (non-GSD repo): start/done only')
         else:
@@ -733,7 +1139,40 @@ def cmd_doctor(a):
 
 def cmd_reconcile(a):
     root = repo_root()
-    return reconcile(root, need_config(root), dry=a.dry_run)
+    cfg = need_config(root)
+    if a.dry_run:
+        return reconcile(root, cfg, dry=True, refresh_text=a.refresh_text)
+    # Share the background sync's lock so a commit-triggered run never races this one.
+    lock = git_path(root, 'jira-sync.lock')
+    for _ in range(LOCK_STALE_S):
+        if lock.exists() and time.time() - lock.stat().st_mtime > LOCK_STALE_S:
+            lock.unlink()
+        try:
+            os.close(os.open(str(lock), os.O_CREAT | os.O_EXCL))
+            break
+        except FileExistsError:
+            time.sleep(1)
+    else:
+        raise SystemExit('jira-sync: another sync is still running (%s)' % lock)
+    try:
+        def out(line):
+            print(line, flush=True)
+            os.utime(lock)
+        return reconcile(root, cfg, out=out, refresh_text=a.refresh_text)
+    finally:
+        lock.unlink()
+
+
+def cmd_epics(a):
+    """Open epics to file new work under."""
+    root = repo_root()
+    cfg = need_config(root)
+    j = Jira(cfg['site'])
+    meta = j.project(cfg['project'])
+    for i in j.search('project = "%s" AND issuetype = %s AND statusCategory != Done ORDER BY key DESC'
+                      % (cfg['project'], meta['epic']), ['summary', 'status'], limit=50):
+        print('%s | %s | %s' % (i['key'], i['fields']['status']['name'], i['fields']['summary']))
+    return 0
 
 
 def cmd_commit_msg(a):
@@ -818,9 +1257,15 @@ def cmd_create(a):
     type_id = meta.get(a.type)
     if not type_id:
         raise SystemExit('project %s has no %s issue type' % (cfg['project'], a.type))
-    fields = {'project': {'key': cfg['project']}, 'issuetype': {'id': type_id}, 'summary': a.summary[:254]}
+    if a.type in ('story', 'task', 'bug') and not a.parent:
+        raise SystemExit('every story, task and bug needs an epic: pass --parent <EPIC KEY> (see `epics`)')
+    if len(a.summary) > 70:
+        raise SystemExit('summary is %d characters; keep it under 70 and put the detail in --description' % len(a.summary))
+    fields = {'project': {'key': cfg['project']}, 'issuetype': {'id': type_id}, 'summary': a.summary}
     if a.description:
-        fields['description'] = adf(a.description)
+        fields['description'] = adf_doc([(h.strip(), 'p', b.strip()) for h, b in
+                                         re.findall(r'^##\s*(.+?)\n(.*?)(?=^##|\Z)', a.description, re.M | re.S)]
+                                        or [('Details', 'p', a.description)], 'created by jira-sync')
     if a.parent:
         fields['parent'] = {'key': a.parent}
     if a.points is not None:
@@ -834,6 +1279,14 @@ def cmd_create(a):
     print('created %s (%s) %s/browse/%s' % (key, a.type, j.base, key))
     if a.points is not None:
         j.comment(key, 'Story points %d (sized against anchors): %s' % (a.points, a.reason))
+    if a.type in ('story', 'task', 'bug'):
+        sp = Sprints(j, cfg['project'])
+        active = sp.ensure_active(print)
+        if active:
+            sp.add(active['id'], [key])
+            print('added to sprint %s' % active['name'])
+        else:
+            print('WARNING no active sprint -- %s left in the backlog' % key)
     if a.start:
         start_issue(root, cfg, j, key, a.branch, a.summary)
     return 0
@@ -1004,7 +1457,10 @@ def main(argv=None):
     sub = p.add_subparsers(dest='cmd', required=True)
     s = sub.add_parser('init'); s.add_argument('--site'); s.add_argument('--project'); s.set_defaults(fn=cmd_init)
     sub.add_parser('doctor').set_defaults(fn=cmd_doctor)
-    s = sub.add_parser('reconcile'); s.add_argument('--dry-run', action='store_true'); s.set_defaults(fn=cmd_reconcile)
+    s = sub.add_parser('reconcile'); s.add_argument('--dry-run', action='store_true')
+    s.add_argument('--refresh-text', action='store_true', help='rewrite summary + description of every synced issue')
+    s.set_defaults(fn=cmd_reconcile)
+    sub.add_parser('epics').set_defaults(fn=cmd_epics)
     s = sub.add_parser('search'); s.add_argument('text'); s.set_defaults(fn=cmd_search)
     s = sub.add_parser('create')
     s.add_argument('--type', required=True, choices=['epic', 'story', 'task', 'bug', 'subtask'])
