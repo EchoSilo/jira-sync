@@ -1068,6 +1068,8 @@ def cmd_init(a):
     root = repo_root()
     cfg = load_config(root) or {}
     cfg.update({k: v for k, v in (('site', a.site), ('project', a.project)) if v})
+    if a.auto_push is not None:
+        cfg['auto_push'] = a.auto_push == 'on'
     if not cfg.get('site') or not cfg.get('project'):
         raise SystemExit('init needs --site and --project the first time')
     write_json(root / CONFIG, cfg)
@@ -1196,7 +1198,8 @@ def cmd_commit_msg(a):
 
 def cmd_post_commit(a):
     root = repo_root()
-    if not load_config(root) or not (root / '.planning').is_dir():
+    cfg = load_config(root)
+    if not cfg or not (cfg.get('auto_push') or (root / '.planning').is_dir()):
         return 0
     args = [sys.executable, str(Path(__file__).resolve()), '_reconcile-locked', str(root)]
     kw = {'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL, 'cwd': str(root)}
@@ -1208,10 +1211,36 @@ def cmd_post_commit(a):
     return 0
 
 
+def auto_push(root):
+    """Push the current branch so the GitHub for Jira app sees new commits. Never forces;
+    skips mid-rebase/merge and detached HEAD; a failure is logged and retried next commit."""
+    gd = Path(git('rev-parse', '--absolute-git-dir', cwd=root))
+    if any((gd / n).exists() for n in ('rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD')):
+        return 'push skipped: rebase/merge in progress'
+    branch = git('branch', '--show-current', cwd=root)
+    if not branch:
+        return 'push skipped: detached HEAD'
+    if not git('remote', cwd=root):
+        return 'push skipped: no remote'
+    has_upstream = bool(git('rev-parse', '--abbrev-ref', '%s@{upstream}' % branch, cwd=root))
+    cmd = ['git', 'push', '--quiet'] + ([] if has_upstream else ['-u', 'origin', branch])
+    r = subprocess.run(cmd, cwd=root, capture_output=True, text=True, timeout=120)
+    return 'pushed %s' % branch if r.returncode == 0 else 'ERROR push failed: %s' % (r.stderr.strip().splitlines() or ['?'])[-1]
+
+
 def cmd_reconcile_locked(a):
     root = Path(a.root)
     cfg = load_config(root)
-    if cfg:
+    if not cfg:
+        return 0
+    if cfg.get('auto_push'):
+        try:
+            msg = auto_push(root)
+        except (subprocess.SubprocessError, OSError) as e:
+            msg = 'ERROR push failed: %s' % e
+        with open(git_path(root, 'jira-sync.log'), 'a', encoding='utf-8') as fh:
+            fh.write('%s %s\n' % (time.strftime('%Y-%m-%d %H:%M:%S'), msg))
+    if (root / '.planning').is_dir():
         locked_reconcile(root, cfg)
     return 0
 
@@ -1455,7 +1484,9 @@ def cmd_link_pr(a):
 def main(argv=None):
     p = argparse.ArgumentParser(prog='jira_sync.py', description=__doc__.split('\n')[0])
     sub = p.add_subparsers(dest='cmd', required=True)
-    s = sub.add_parser('init'); s.add_argument('--site'); s.add_argument('--project'); s.set_defaults(fn=cmd_init)
+    s = sub.add_parser('init'); s.add_argument('--site'); s.add_argument('--project')
+    s.add_argument('--auto-push', choices=['on', 'off'], help='push the branch after every commit so Jira sees it')
+    s.set_defaults(fn=cmd_init)
     sub.add_parser('doctor').set_defaults(fn=cmd_doctor)
     s = sub.add_parser('reconcile'); s.add_argument('--dry-run', action='store_true')
     s.add_argument('--refresh-text', action='store_true', help='rewrite summary + description of every synced issue')
