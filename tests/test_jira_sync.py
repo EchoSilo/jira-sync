@@ -25,6 +25,11 @@ def test_resolve_key_order():
     assert r('feat(41-09): x', 'main', cache, None, 'PROJ') == 'PROJ-12'            # falls back to epic
     assert r('chore: tidy', 'main', cache, 'PROJ-1', 'PROJ') == 'PROJ-1'            # active issue
     assert r('chore: UTF-8 fix', 'main', {}, None, 'PROJ') is None                  # not a key
+    sub = dict(cache, **{'41-04-t2': 'PROJ-22', '41-ops': 'PROJ-13'})
+    assert r('feat(41-04): x', 'main', sub, None, 'PROJ', '41-04-t2') == 'PROJ-22'     # task sub-task first
+    assert r('docs(41-04): complete', 'main', sub, None, 'PROJ', None) == 'PROJ-20'    # bookkeeping -> story
+    assert r('docs(41): verification report', 'main', sub, None, 'PROJ') == 'PROJ-13'  # phase work -> ops task
+    assert r('feat(41-09): x', 'main', sub, None, 'PROJ') == 'PROJ-13'                 # unknown plan -> ops task
     assert js.tag_message('feat(41-04): x\n\nbody\n', 'PROJ-20') == 'feat(41-04): x [PROJ-20]\n\nbody\n'
 
 
@@ -117,6 +122,19 @@ def test_anchor_triangulation():
     assert js.size_against(sc[8] + gap * 0.5, a)[0] == 8         # a bit past the top -> 8
     assert js.size_against(sc[8] + gap, a)[0] == 13             # a full step past the top -> 13
     assert js.propose_anchors(stories[:3]) == []                # too few finished stories
+
+
+def test_subtask_for():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        write(root, '.planning/phases/41-x/41-04-PLAN.md',
+              '<task type="auto"><name>A</name><files>src/a.ts, src/a.check.ts</files></task>\n'
+              '<task type="auto"><name>B</name><files>src/b.ts, tests/b.spec.ts</files></task>\n')
+        assert js.subtask_for(root, '41-04', ['src/b.ts', 'tests/b.spec.ts', 'src/a.ts']) == '41-04-t2'
+        assert js.subtask_for(root, '41-04', ['src/a.ts']) == '41-04-t1'
+        assert js.subtask_for(root, '41-04', ['README.md']) is None
+        assert js.subtask_for(root, '41-04', ['src/a.ts', '.planning/phases/41-x/41-04-SUMMARY.md']) is None
+        assert js.subtask_for(root, '41-09', ['src/a.ts']) is None
 
 
 def test_short_title():

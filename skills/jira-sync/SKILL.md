@@ -74,7 +74,7 @@ Stories are sized on the Fibonacci scale **1, 2, 3, 5, 8, 13** by comparing them
 
 ## What happens automatically
 
-- **commit-msg hook:** appends ` [KEY]` to every commit subject. It uses, first match wins: a key already in the message, then a key in the branch name, then the GSD scope (`feat(41-04):` maps to that plan's story, `docs(41):` to the phase epic, `quick-…` to its task), then the current issue. It never blocks a commit.
+- **commit-msg hook:** appends ` [KEY]` to every commit subject, picking the most specific issue. First match wins: a key already in the message; a key in the branch name; for a GSD plan commit (`feat(41-04):`), the **sub-task** whose `<files>` overlap the staged files most, then the plan's **story** (its `complete` commit and anything unmatched); for a phase-wide commit (`docs(41):` planning/review/verification), that phase's **"planning, review and verification" task**; `quick-…` to its task; then the current issue. Commits never land on an epic. Never blocks a commit.
 - **post-commit hook (GSD repos):** reconciles in the background from `.planning/` and logs to `.git/jira-sync.log`. Statuses only ever move forward, so it never reopens something a person closed. The background run follows these rules:
   - **Text:** summaries are short titles (60 characters at most). Descriptions are built from the GSD files:
     - epic: goal, success criteria, requirements;

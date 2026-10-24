@@ -102,19 +102,45 @@ def scope_ids(subject):
     return ['%s-%s' % (m.group(1), m.group(2)), m.group(1)] if m.group(2) else [m.group(1)]
 
 
-def resolve_key(msg, branch, cache, active, project):
-    """The issue key a commit belongs to, or None. First match wins:
-    key already in message -> key in branch -> GSD scope -> active issue."""
+def resolve_key(msg, branch, cache, active, project, subtask=None):
+    """The issue key a commit belongs to, or None. First match wins: key already in
+    message -> key in branch -> GSD scope (plan task sub-task -> plan story -> phase's
+    planning/review task -> phase epic) -> active issue."""
     kre = key_re(project)
     if kre.search(msg):
         return None  # already linked; leave the message alone
     m = kre.search(branch or '')
     if m:
         return m.group(0)
-    for gid in scope_ids(msg.splitlines()[0] if msg else ''):
-        if gid in cache:
+    ids = scope_ids(msg.splitlines()[0] if msg else '')
+    if len(ids) == 2:
+        candidates = [subtask, ids[0], ids[1] + '-ops', ids[1]]
+    elif ids and not ids[0].startswith('quick-'):
+        candidates = [ids[0] + '-ops', ids[0]]
+    else:
+        candidates = ids
+    for gid in candidates:
+        if gid and gid in cache:
             return cache[gid]
     return active or None
+
+
+def subtask_for(root, pid, staged):
+    """Which task of plan `pid` a commit is: the task whose <files> overlap the staged files
+    most. None for the plan's own bookkeeping commit (SUMMARY.md staged) or no overlap."""
+    if not pid or any(f.endswith('%s-SUMMARY.md' % pid) for f in staged):
+        return None
+    plan = next(iter((root / '.planning' / 'phases').glob('%s-*/%s-PLAN.md' % (pid.rsplit('-', 1)[0], pid))), None)
+    if not plan:
+        return None
+    staged = {s.replace('\\', '/') for s in staged}
+    best, best_n = None, 0
+    for i, block in enumerate(re.findall(r'<task\b[^>]*>.*?</task>', plan.read_text(encoding='utf-8'), re.S), 1):
+        files = {f.strip().replace('\\', '/') for f in tag(block, 'files').split(',') if f.strip()}
+        n = len(files & staged)
+        if n > best_n:
+            best, best_n = '%s-t%d' % (pid, i), n
+    return best
 
 
 def tag_message(msg, key):
@@ -417,7 +443,15 @@ def gsd_items(root, started_ids=(), add_dates=None, starts=None):
                                  'version': None, 'path': rel(p), 'sections': subtask_sections(block),
                                  'created_at': None, 'done_at': None})
         phase['cat'] = 'done' if done else 'indeterminate' if any_started else 'new'
+        finished = re.search(r'^- \[x\] \**Phase %s:.*?completed (\d{4}-\d{2}-\d{2})' % re.escape(num), roadmap, re.M)
+        ops = {'id': num + '-ops', 'type': 'task', 'summary': 'Phase %s planning, review and verification' % num,
+               'parent': num, 'cat': phase['cat'], 'version': version, 'path': rel(d),
+               'sections': [('Purpose', 'p', 'Phase-level work for phase %s that belongs to no single plan: '
+                             'discussion, research, planning, code review, verification and UAT. Commits scoped to '
+                             'the phase as a whole (for example docs(%s): ...) link here.' % (num, num))],
+               'created_at': starts.get(num), 'done_at': finished.group(1) + 'T23:59:59+00:00' if finished else None}
         items.append(phase)
+        items.append(ops)
         items.extend(children)
 
     def epic_for(created_at, is_open):
@@ -803,7 +837,7 @@ class Sprints:
         return h
 
 
-def assign_sprints(j, sp, project, meta, have, items, out, dry=False):
+def assign_sprints(j, sp, project, meta, have, items, out, dry=False, fresh=()):
     """Every Story/Task/Bug sits in a sprint: open work in the active sprint, finished work
     in the sprint whose dates cover when it finished, pre-Jira work in the history sprint."""
     warnings = []
@@ -813,15 +847,17 @@ def assign_sprints(j, sp, project, meta, have, items, out, dry=False):
     if not active:
         return warnings + ['no active sprint -- items stay in the backlog until one exists']
     types = ','.join(str(meta[t]) for t in ('story', 'task', 'bug') if meta.get(t))
-    loose = j.search('project = "%s" AND labels = "%s" AND issuetype in (%s) AND sprint is EMPTY'
-                     % (project, SYNC_LABEL, types), ['labels'])
+    loose = [i['key'] for i in j.search('project = "%s" AND labels = "%s" AND issuetype in (%s) AND sprint is EMPTY'
+                                        % (project, SYNC_LABEL, types), ['labels'])]
+    # Issues created this run may not be searchable yet (index lag), so add them by key.
+    loose += [k for k in fresh if k not in loose]
     by_key = {v['key']: gid for gid, v in have.items()}
     item_by_id = {it['id']: it for it in items}
     real = sp.by_state('active') + sp.by_state('future') + sp.by_state('closed')
     first_start = min((parse_ts(s['startDate']) for s in real if s.get('startDate')), default=None)
     plan, skipped = {}, 0
-    for i in loose:
-        it = item_by_id.get(by_key.get(i['key']))
+    for key in loose:
+        it = item_by_id.get(by_key.get(key))
         done_at = parse_ts(it['done_at']) if it and it.get('done_at') else None
         target = active
         if done_at and first_start and done_at < first_start:
@@ -833,7 +869,7 @@ def assign_sprints(j, sp, project, meta, have, items, out, dry=False):
                 skipped += 1  # Jira does not accept issues into a closed sprint
                 continue
             target = cover or active
-        plan.setdefault('history' if target == 'history' else target['id'], []).append(i['key'])
+        plan.setdefault('history' if target == 'history' else target['id'], []).append(key)
     if 'history' in plan:
         earliest = min(parse_ts(item_by_id[by_key[k]]['done_at']) for k in plan['history'])
         if dry:
@@ -869,6 +905,7 @@ def reconcile(root, cfg, dry=False, out=print, refresh_text=False):
     pf = meta['points']
     have = j.synced(project, pf)
     version_id, created, moved, sized, fixed, warnings = None, 0, 0, 0, 0, []
+    fresh = []  # keys of stories/tasks/bugs created this run
     anchors = (cfg.get('estimation') or {}).get('anchors') or []
     if any(it['type'] == 'story' for it in items):
         if not pf:
@@ -943,6 +980,8 @@ def reconcile(root, cfg, dry=False, out=print, refresh_text=False):
                 warnings.append('%s created without fix version: %s' % (key, e))
             cur = have[it['id']] = {'key': key, 'cat': 'new', 'points': pts, 'parent': parent and parent['key']}
             created += 1
+            if it['type'] in ('story', 'task', 'bug'):
+                fresh.append(key)
             out('created %s %s (%s)%s' % (key, it['id'], it['type'], ' %d pts' % pts if pts else ''))
             if pts:
                 j.comment(key, note)
@@ -985,7 +1024,7 @@ def reconcile(root, cfg, dry=False, out=print, refresh_text=False):
             moved += 1
             cur['cat'] = it['cat']
     try:
-        warnings += assign_sprints(j, Sprints(j, project), project, meta, have, items, out, dry)
+        warnings += assign_sprints(j, Sprints(j, project), project, meta, have, items, out, dry, fresh)
     except JiraError as e:
         warnings.append('sprint assignment failed: %s' % e)
     if not dry:
@@ -1188,7 +1227,10 @@ def cmd_commit_msg(a):
         cache = read_json(git_path(root, 'jira-sync-map.json'), {})
         active_f = git_path(root, 'jira-sync-active')
         active = active_f.read_text(encoding='utf-8').strip() if active_f.exists() else None
-        key = resolve_key(msg, git('branch', '--show-current', cwd=root), cache, active, cfg['project'])
+        ids = scope_ids(msg.splitlines()[0])
+        staged = git('diff', '--cached', '--name-only', cwd=root).splitlines()
+        sub = subtask_for(root, ids[0], staged) if len(ids) == 2 else None
+        key = resolve_key(msg, git('branch', '--show-current', cwd=root), cache, active, cfg['project'], sub)
         if key and not key.startswith('('):
             path.write_text(tag_message(msg, key), encoding='utf-8')
     except Exception as e:  # never block a commit
