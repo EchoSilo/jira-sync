@@ -24,7 +24,7 @@ flowchart LR
             PC["post-commit<br/>background: push + reconcile"]
         end
         Cache[(".git/jira-sync-map.json<br/>offline key cache")]
-        Dev -->|git commit| CM --> PC
+        Dev -->|"git commit"| CM --> PC
         GSD -. read .-> PC
         Cache -. lookup .-> CM
     end
@@ -42,15 +42,15 @@ flowchart LR
         DevPanel["Development panel<br/>commits · branches · PRs"]
     end
 
-    PC -->|git push| Repo
-    Skill -->|gh pr create → title gets KEY| PR
-    PC ==>|REST API: create · transition ·<br/>epic · sprint · points| Issues
-    Skill ==>|REST API| Issues
+    PC -->|"git push"| Repo
+    Skill -->|"gh pr create, title gets KEY"| PR
+    PC ==>|"REST API: create, transition,<br/>epic, sprint, points"| Issues
+    Skill ==>|"REST API"| Issues
     Issues --- Sprint
     Issues --- Points
-    Issues -. labels gsd-ID rebuild .-> Cache
-    Repo -->|GitHub for Jira app<br/>matches [KEY]| DevPanel
-    PR -->|GitHub for Jira app| DevPanel
+    Issues -. "labels gsd-ID rebuild" .-> Cache
+    Repo -->|"GitHub for Jira app<br/>matches the KEY"| DevPanel
+    PR -->|"GitHub for Jira app"| DevPanel
     DevPanel --- Issues
 
     linkStyle default stroke:#888
