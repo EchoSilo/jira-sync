@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "jira-sync",
+  "description": "Jira + GitHub tracking for any repo, GSD-aware.",
+  "owner": {
+    "name": "EchoSilo",
+    "url": "https://github.com/EchoSilo"
+  },
+  "plugins": [
+    {
+      "name": "jira-sync",
+      "description": "Issue keys on every commit and PR; GSD milestones, phases, plans and tasks mirrored into Jira.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}
