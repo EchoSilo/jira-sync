@@ -137,6 +137,17 @@ def test_subtask_for():
         assert js.subtask_for(root, '41-09', ['src/a.ts']) is None
 
 
+def test_site_allowed():
+    import os
+    os.environ.pop('JIRA_ALLOWED_HOSTS', None)
+    assert js.site_allowed('echosilopoc01.atlassian.net')
+    for bad in ('evil.com', 'atlassian.net.evil.com', 'evil.com/x.atlassian.net', 'x.atlassian.net.evil.com'):
+        assert not js.site_allowed(bad), bad
+    os.environ['JIRA_ALLOWED_HOSTS'] = 'jira.mycorp.com'
+    assert js.site_allowed('jira.mycorp.com') and not js.site_allowed('evil.com')
+    os.environ.pop('JIRA_ALLOWED_HOSTS')
+
+
 def test_short_title():
     st = js.short_title
     assert st('Task 1: Tracer -- Your bets renders from the report: counts, every leg status, direction markers') \

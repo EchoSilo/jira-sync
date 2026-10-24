@@ -575,12 +575,28 @@ def adf(text):
         for line in text.split('\n') if line.strip()]}
 
 
+def site_allowed(host):
+    """Credentials only go to Atlassian Cloud or hosts the user listed themselves
+    (JIRA_ALLOWED_HOSTS lives in the user's environment, never in the repo)."""
+    host = host.lower().split(':')[0]
+    if re.fullmatch(r'[a-z0-9-]+\.atlassian\.net', host):
+        return True
+    allowed = {h.strip().lower() for h in (_env_one('JIRA_ALLOWED_HOSTS') or '').split(',') if h.strip()}
+    return host in allowed
+
+
 class Jira:
     def __init__(self, site):
+        site = re.sub(r'^https?://', '', site).split('/')[0].lower()
+        if not site_allowed(site):
+            # The site comes from the repo's committed config: never let a cloned repo
+            # redirect your credentials to a host you did not choose.
+            raise JiraError('refusing to send Jira credentials to %s: only *.atlassian.net is trusted. '
+                            'For a self-hosted Jira, add the host to the JIRA_ALLOWED_HOSTS '
+                            'environment variable (comma-separated).' % site)
         email, token = env('JIRA_EMAIL'), env('JIRA_API_TOKEN')
         if not email or not token:
             raise JiraError('JIRA_EMAIL and/or JIRA_API_TOKEN are not set')
-        site = re.sub(r'^https?://', '', site).split('/')[0]
         self.base = 'https://' + site
         self.auth = 'Basic ' + base64.b64encode(('%s:%s' % (email, token)).encode()).decode()
 

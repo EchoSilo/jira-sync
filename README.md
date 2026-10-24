@@ -230,6 +230,14 @@ Commits never land on an Epic.
 | Background sync and push log | `.git/jira-sync.log` |
 | Script used by git hooks | `~/.jira-sync/jira_sync.py`, refreshed from the plugin on every manual run |
 
+## Security
+
+- **Credentials** come from your environment variables, or from the `.env` file of the repo you are in. They are never printed or written anywhere by jira-sync. `doctor` lists only the names of Jira-related keys, never their values.
+- **Where credentials go:** they are sent only over HTTPS, and only to `*.atlassian.net`. A repo's committed `.jira-sync.json` cannot redirect them elsewhere. For self-hosted Jira, list the host yourself in the `JIRA_ALLOWED_HOSTS` environment variable.
+- **Nothing runs just because you cloned a repo.** The git hooks are installed only when you run `init` yourself. The plugin's own hook only renames a PR you just created, and it never contacts Jira.
+- **Auto-push is opt-in** (`--auto-push on`). Once on, every commit is pushed automatically, so a secret committed by mistake reaches GitHub at once. Keep `.env` and other secrets in `.gitignore`.
+- **Commands are run safely:** git and gh are called with argument lists, never through a shell, and Jira search text is escaped.
+
 ## Test
 
 ```
