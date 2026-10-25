@@ -33,6 +33,20 @@ def test_resolve_key_order():
     assert js.tag_message('feat(41-04): x\n\nbody\n', 'PROJ-20') == 'feat(41-04): x [PROJ-20]\n\nbody\n'
 
 
+def test_commit_has_issue():
+    cache = {'41-04': 'PROJ-20'}
+    h = js.commit_has_issue
+    assert not h('git commit -m "fix(gaps): x"', 'main', cache, None, 'PROJ')            # the blocked case
+    assert h('git commit -m "fix(gaps): x"', 'main', cache, 'PROJ-1', 'PROJ')            # current issue
+    assert h('git commit -m "fix: x [PROJ-9]"', 'main', cache, None, 'PROJ')             # key in message
+    assert h('git commit -m "fix: x"', 'PROJ-7-fix', cache, None, 'PROJ')                # key in branch
+    assert h("git commit -F - <<'EOF'\nfeat(41-04): x\nEOF", 'main', cache, None, 'PROJ')  # GSD plan, heredoc
+    assert not h('git commit -m "feat(99-01): x"', 'main', cache, None, 'PROJ')          # unknown plan
+    m = js.GIT_COMMIT_RE.search
+    assert m('cd x && git commit -q -m y') and m('git -C "a b" commit') and m('git commit --amend')
+    assert not m('git log --grep commit') and not m('git status')
+
+
 def test_pick_transition():
     opts = [{'id': '11', 'to': {'statusCategory': {'key': 'new'}}},
             {'id': '21', 'to': {'statusCategory': {'key': 'indeterminate'}}},

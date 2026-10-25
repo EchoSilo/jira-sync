@@ -1,6 +1,6 @@
 ---
 name: jira-sync
-description: Track code work in Jira with GitHub links. Use in any git repo that has a .jira-sync.json file when starting, switching or finishing a piece of work (bug fix, feature, chore), when the user asks to sync, start, close or check Jira issues, or to set a repo up for Jira tracking. GSD repos (.planning/) sync automatically on every commit; milestones become fix versions, phases epics, plans stories and plan tasks sub-tasks.
+description: Track code work in Jira with GitHub links. Use in any git repo that has a .jira-sync.json file before the first file edit of any non-GSD request (however small), when switching or finishing a piece of work (bug fix, feature, chore), when the user asks to sync, start, close or check Jira issues, or to set a repo up for Jira tracking. GSD repos (.planning/) sync automatically on every commit; milestones become fix versions, phases epics, plans stories and plan tasks sub-tasks.
 argument-hint: "[start \"<what you're doing>\" | done [KEY] | sync | status | doctor | init --site <x.atlassian.net> --project <KEY>]"
 allowed-tools: [Bash, Read]
 ---
@@ -27,6 +27,8 @@ If the repo has no `.jira-sync.json` and the user didn't ask for `init`, say Jir
 | `done [KEY]` | `done [KEY]`. With no key it closes the current issue. |
 
 ## Starting work (non-GSD, or ad-hoc work in a GSD repo)
+
+**When:** before the first file edit of any request that is not a GSD plan, however small (a copy tweak, an annoying alert, a one-line fix). Run `status`; if it says `current issue: none`, start one now. Small requests are the ones that get missed. As a backstop, the plugin's commit check refuses a `git commit` that would land on no issue (see below), but by then the work is done untracked.
 
 1. Run `search "<3-5 distinctive words>"`. If an open issue clearly matches the work, reuse it with `use <KEY> [--branch]`. If it's ambiguous, ask the user which one.
 2. Otherwise pick the type from what the work *is*, not how big it feels:
@@ -74,7 +76,8 @@ Stories are sized on the Fibonacci scale **1, 2, 3, 5, 8, 13** by comparing them
 
 ## What happens automatically
 
-- **commit-msg hook:** appends ` [KEY]` to every commit subject, picking the most specific issue. First match wins: a key already in the message; a key in the branch name; for a GSD plan commit (`feat(41-04):`), the **sub-task** whose `<files>` overlap the staged files most, then the plan's **story** (its `complete` commit and anything unmatched); for a phase-wide commit (`docs(41):` planning/review/verification), that phase's **"planning, review and verification" task**; `quick-…` to its task; then the current issue. Commits never land on an epic. Never blocks a commit.
+- **commit-msg hook:** appends ` [KEY]` to every commit subject, picking the most specific issue. First match wins: a key already in the message; a key in the branch name; for a GSD plan commit (`feat(41-04):`), the **sub-task** whose `<files>` overlap the staged files most, then the plan's **story** (its `complete` commit and anything unmatched); for a phase-wide commit (`docs(41):` planning/review/verification), that phase's **"planning, review and verification" task**; `quick-…` to its task; then the current issue. Commits never land on an epic. The git hook itself never blocks a commit.
+- **Commit check (Claude Code PreToolUse hook):** refuses a `git commit` Claude runs when it would land on no issue: no key in the message or branch, not a GSD plan/phase commit, and no current issue. The refusal says what to do: `start` (or `use <KEY>`), then retry. Commits a person makes in a terminal are not checked. Any error inside the check lets the commit through.
 - **post-commit hook (GSD repos):** reconciles in the background from `.planning/` and logs to `.git/jira-sync.log`. Statuses only ever move forward, so it never reopens something a person closed. The background run follows these rules:
   - **Text:** summaries are short titles (60 characters at most). Descriptions are built from the GSD files:
     - epic: goal, success criteria, requirements;

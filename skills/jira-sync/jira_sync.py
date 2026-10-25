@@ -1669,6 +1669,59 @@ def cmd_link_pr(a):
     return 0
 
 
+GIT_COMMIT_RE = re.compile(r'\bgit\s+(?:-[Cc]\s+("[^"]*"|\S+)\s+)*commit\b')
+COMMIT_FILE_RE = re.compile(r'(?:\s-F\s*|--file[=\s])("[^"]*"|\S+)')
+BLOCK_MSG = ('jira-sync: this commit would land on no Jira issue (no key in the message or branch, '
+             'not a GSD plan commit, and no current issue). Before committing, run '
+             '`/jira-sync start "<what the work is>"` (or `use <KEY>` for an existing issue), '
+             'then retry the commit. Work already committed untracked: start an issue, then link '
+             'it with an empty `chore: link <sha>` commit.')
+
+
+def commit_has_issue(text, branch, cache, active, project):
+    """Would a commit whose message is somewhere in `text` resolve to an issue? `text` is the
+    raw shell command (plus any -F file / amended message), so every `type(scope):` in it is
+    tried as a subject -- quoting and heredocs make the real subject unknowable here."""
+    if key_re(project).search(text) or resolve_key('', branch, cache, active, project):
+        return True
+    return any(resolve_key('x(%s): x' % m.group(1), branch, cache, None, project)
+               for m in re.finditer(r'\w+!?\(([^)\s]+)\)!?:', text))
+
+
+def cmd_check_commit(a):
+    """PreToolUse hook: refuse a `git commit` that would carry no issue key (exit 2 blocks the
+    tool call and shows Claude the reason). Any doubt or internal error lets the commit through."""
+    try:
+        data = json.load(sys.stdin)
+        cmd = (data.get('tool_input') or {}).get('command', '')
+        m = GIT_COMMIT_RE.search(cmd)
+        if not m:
+            return 0
+        cwd = data.get('cwd') or None
+        if m.group(1):
+            cwd = str(Path(cwd or '.') / m.group(1).strip('"'))
+        root = repo_root(cwd)
+        cfg = load_config(root)
+        if not cfg:
+            return 0
+        text = cmd
+        for f in COMMIT_FILE_RE.findall(cmd):
+            p = Path(cwd or root) / f.strip('"')
+            text += '\n' + (p.read_text(encoding='utf-8') if p.is_file() else '')
+        if '--amend' in cmd:
+            text += '\n' + git('log', '-1', '--format=%B', cwd=root)
+        cache = read_json(git_path(root, 'jira-sync-map.json'), {})
+        active_f = git_path(root, 'jira-sync-active')
+        active = active_f.read_text(encoding='utf-8').strip() if active_f.exists() else None
+        if commit_has_issue(text, git('branch', '--show-current', cwd=root), cache, active, cfg['project']):
+            return 0
+    except BaseException as e:  # never block on our own failure
+        print('jira-sync: check-commit skipped (%s)' % e, file=sys.stderr)
+        return 0
+    print(BLOCK_MSG, file=sys.stderr)
+    return 2
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog='jira_sync.py', description=__doc__.split('\n')[0])
     sub = p.add_subparsers(dest='cmd', required=True)
@@ -1703,8 +1756,9 @@ def main(argv=None):
     sub.add_parser('post-commit').set_defaults(fn=cmd_post_commit)
     s = sub.add_parser('_reconcile-locked'); s.add_argument('root'); s.set_defaults(fn=cmd_reconcile_locked)
     s = sub.add_parser('link-pr'); s.add_argument('--if-gh-pr-create', action='store_true'); s.set_defaults(fn=cmd_link_pr)
+    sub.add_parser('check-commit').set_defaults(fn=cmd_check_commit)
     a = p.parse_args(argv)
-    if a.cmd not in ('commit-msg', 'post-commit', '_reconcile-locked', 'link-pr'):
+    if a.cmd not in ('commit-msg', 'post-commit', '_reconcile-locked', 'link-pr', 'check-commit'):
         sync_stable_copy()
     try:
         return a.fn(a) or 0

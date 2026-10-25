@@ -169,6 +169,8 @@ First match wins:
 5. `quick-…` goes to its Task.
 6. Otherwise, the **current issue** set by `/jira-sync start`.
 
+If none of these match, the commit would be untracked. When Claude runs that commit, the plugin's PreToolUse hook (`check-commit`) refuses it and tells Claude to `/jira-sync start` first. Your own terminal commits are never blocked.
+
 Commits never land on an Epic.
 
 ### Sprints
