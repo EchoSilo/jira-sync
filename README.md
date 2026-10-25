@@ -173,6 +173,10 @@ If none of these match, the commit would be untracked. When Claude runs that com
 
 Commits never land on an Epic.
 
+### Plans become issues when they are approved
+
+Work is filed in Jira when its plan is approved, not when the first commit lands. When Claude leaves plan mode with an approved plan in a repo that has `.jira-sync.json`, the plugin's PostToolUse hook (`plan-approved`, matcher `ExitPlanMode`) reminds it to `search`, then `create` an epic with a child per deliverable (or one issue for one-step work) and start the first, before editing anything. A rejected plan creates nothing. GSD plans are still created by the post-commit sync; `reconcile` files them early if the plan files are not committed yet.
+
 ### Sprints
 
 - **Where items go:**

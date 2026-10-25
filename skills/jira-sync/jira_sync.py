@@ -1722,6 +1722,38 @@ def cmd_check_commit(a):
     return 2
 
 
+PLAN_APPROVED_MSG = ('jira-sync: a plan was just approved in a Jira-tracked repo. Before the first file edit, '
+                     'put it in Jira: `search` for an existing match, then `create` an epic with a story, task '
+                     'or bug per deliverable (or a single issue for one-step work) and `--start` the first one, '
+                     'as in the skill Starting work steps. Report the keys. In a GSD repo whose plan files are '
+                     'not committed yet, run `reconcile` instead so the phase and its plans appear now.')
+
+
+def plan_approved_context(data):
+    """additionalContext for the PostToolUse hook on ExitPlanMode, or None when nothing applies."""
+    if data.get('tool_name') != 'ExitPlanMode':
+        return None
+    resp = data.get('tool_response')
+    if isinstance(resp, dict) and resp.get('error'):
+        return None  # plan rejected: nothing was approved
+    return PLAN_APPROVED_MSG
+
+
+def cmd_plan_approved(a):
+    """PostToolUse hook: once a plan is approved, tell Claude to file it in Jira before editing.
+    A reminder, not an auto-create: issue type, epic and summary need judgement."""
+    try:
+        data = json.load(sys.stdin)
+        if not load_config(repo_root(data.get('cwd'))):
+            return 0
+        ctx = plan_approved_context(data)
+        if ctx:
+            print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PostToolUse', 'additionalContext': ctx}}))
+    except BaseException as e:  # never get in the way of the session
+        print('jira-sync: plan-approved skipped (%s)' % e, file=sys.stderr)
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog='jira_sync.py', description=__doc__.split('\n')[0])
     sub = p.add_subparsers(dest='cmd', required=True)
@@ -1755,6 +1787,7 @@ def main(argv=None):
     s = sub.add_parser('commit-msg'); s.add_argument('file'); s.set_defaults(fn=cmd_commit_msg)
     sub.add_parser('post-commit').set_defaults(fn=cmd_post_commit)
     s = sub.add_parser('_reconcile-locked'); s.add_argument('root'); s.set_defaults(fn=cmd_reconcile_locked)
+    s = sub.add_parser('plan-approved'); s.set_defaults(fn=cmd_plan_approved)
     s = sub.add_parser('link-pr'); s.add_argument('--if-gh-pr-create', action='store_true'); s.set_defaults(fn=cmd_link_pr)
     sub.add_parser('check-commit').set_defaults(fn=cmd_check_commit)
     a = p.parse_args(argv)

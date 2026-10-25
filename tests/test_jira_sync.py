@@ -33,6 +33,14 @@ def test_resolve_key_order():
     assert js.tag_message('feat(41-04): x\n\nbody\n', 'PROJ-20') == 'feat(41-04): x [PROJ-20]\n\nbody\n'
 
 
+def test_plan_approved_context():
+    c = js.plan_approved_context
+    assert c({'tool_name': 'ExitPlanMode', 'tool_response': {'plan': 'x'}}) == js.PLAN_APPROVED_MSG
+    assert c({'tool_name': 'ExitPlanMode', 'tool_response': 'approved'}) == js.PLAN_APPROVED_MSG
+    assert c({'tool_name': 'ExitPlanMode', 'tool_response': {'error': 'rejected'}}) is None
+    assert c({'tool_name': 'Bash'}) is None
+
+
 def test_commit_has_issue():
     cache = {'41-04': 'PROJ-20'}
     h = js.commit_has_issue

@@ -1,6 +1,6 @@
 ---
 name: jira-sync
-description: Track code work in Jira with GitHub links. Use in any git repo that has a .jira-sync.json file before the first file edit of any non-GSD request (however small), when switching or finishing a piece of work (bug fix, feature, chore), when the user asks to sync, start, close or check Jira issues, or to set a repo up for Jira tracking. GSD repos (.planning/) sync automatically on every commit; milestones become fix versions, phases epics, plans stories and plan tasks sub-tasks.
+description: Track code work in Jira with GitHub links. Use in any git repo that has a .jira-sync.json file as soon as a plan is approved (GSD or not) and before the first file edit of any non-GSD request (however small), when switching or finishing a piece of work (bug fix, feature, chore), when the user asks to sync, start, close or check Jira issues, or to set a repo up for Jira tracking. GSD repos (.planning/) sync automatically on every commit; milestones become fix versions, phases epics, plans stories and plan tasks sub-tasks.
 argument-hint: "[start \"<what you're doing>\" | done [KEY] | sync | status | doctor | init --site <x.atlassian.net> --project <KEY>]"
 allowed-tools: [Bash, Read]
 ---
@@ -25,6 +25,14 @@ If the repo has no `.jira-sync.json` and the user didn't ask for `init`, say Jir
 | `status` | `status` |
 | `start "<work>"` | Follow **Starting work** below. |
 | `done [KEY]` | `done [KEY]`. With no key it closes the current issue. |
+
+## Planned work: file it when the plan is approved
+
+A plan becomes Jira issues the moment it is approved, not at the first commit. The trigger is the approval itself: plan mode's `ExitPlanMode` (the plugin's PostToolUse hook reminds Claude), or the user saying to go ahead with a plan written in chat or a file.
+
+- **Non-GSD plan:** follow **Starting work** below, sized to the plan: one deliverable is one story, task or bug; several deliverables are an epic with one child per deliverable (stage, step or part the plan names). `--start` the first child and `use` each next one as the work reaches it. Put the plan's path in the epic's `## Notes`.
+- **GSD plan:** planning commits create the epic, stories and sub-tasks through the post-commit hook. If the plan files are not committed yet, run `reconcile` straight after planning so they appear now.
+- A rejected plan creates nothing.
 
 ## Starting work (non-GSD, or ad-hoc work in a GSD repo)
 
@@ -77,6 +85,7 @@ Stories are sized on the Fibonacci scale **1, 2, 3, 5, 8, 13** by comparing them
 ## What happens automatically
 
 - **commit-msg hook:** appends ` [KEY]` to every commit subject, picking the most specific issue. First match wins: a key already in the message; a key in the branch name; for a GSD plan commit (`feat(41-04):`), the **sub-task** whose `<files>` overlap the staged files most, then the plan's **story** (its `complete` commit and anything unmatched); for a phase-wide commit (`docs(41):` planning/review/verification), that phase's **"planning, review and verification" task**; `quick-…` to its task; then the current issue. Commits never land on an epic. The git hook itself never blocks a commit.
+- **Plan-approved reminder (Claude Code PostToolUse hook on `ExitPlanMode`):** in a repo with `.jira-sync.json`, an approved plan adds a note telling Claude to file the plan in Jira before the first edit (see **Planned work** above). It is a reminder, not an auto-create: issue type, epic and summary need judgement. A rejected plan adds nothing; any error stays silent.
 - **Commit check (Claude Code PreToolUse hook):** refuses a `git commit` Claude runs when it would land on no issue: no key in the message or branch, not a GSD plan/phase commit, and no current issue. The refusal says what to do: `start` (or `use <KEY>`), then retry. Commits a person makes in a terminal are not checked. Any error inside the check lets the commit through.
 - **post-commit hook (GSD repos):** reconciles in the background from `.planning/` and logs to `.git/jira-sync.log`. Statuses only ever move forward, so it never reopens something a person closed. The background run follows these rules:
   - **Text:** summaries are short titles (60 characters at most). Descriptions are built from the GSD files:
